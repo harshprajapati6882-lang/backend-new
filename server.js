@@ -49,7 +49,30 @@ async function placeOrder({ apiUrl, apiKey, service, link, quantity }) {
 }
 
 /* =========================
-   🔥 CHECK ORDER STATUS FROM SMM PANEL
+   🔥 CANCEL ORDER IN SMM PANEL
+========================= */
+async function cancelOrderInSmmPanel({ apiUrl, apiKey, orderId }) {
+  try {
+    const params = new URLSearchParams({
+      key: apiKey,
+      action: 'cancel',
+      order: String(orderId),
+    });
+
+    const response = await axios.post(apiUrl, params.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    });
+
+    console.log(`[CANCEL] SMM Panel response for order ${orderId}:`, response.data);
+    return response.data;
+  } catch (err) {
+    console.error(`[CANCEL] Failed to cancel order ${orderId} in SMM panel:`, err.response?.data || err.message);
+    return { error: err.message };
+  }
+}
+
+/* =========================
+   CHECK ORDER STATUS FROM SMM PANEL
 ========================= */
 async function checkOrderStatus({ apiUrl, apiKey, orderId }) {
   const params = new URLSearchParams({
@@ -162,7 +185,7 @@ async function executeRun(run) {
 }
 
 /* =========================
-   🔥 CHECK RUN STATUSES FROM SMM PANEL
+   CHECK RUN STATUSES FROM SMM PANEL
 ========================= */
 async function checkRunStatuses() {
   for (let run of allRuns) {
@@ -216,7 +239,7 @@ setInterval(async () => {
 
 }, 10000);
 
-// 🔥 Check SMM panel statuses every 30 seconds
+// Check SMM panel statuses every 30 seconds
 setInterval(async () => {
   await checkRunStatuses();
 }, 30000);
@@ -242,9 +265,9 @@ app.post('/api/order', async (req, res) => {
 });
 
 /* =========================
-   🔥 CANCEL ALL RUNS FOR A LINK
+   🔥 CANCEL ALL RUNS FOR A LINK (WITH SMM PANEL CANCELLATION)
 ========================= */
-app.post('/api/cancel', (req, res) => {
+app.post('/api/cancel', async (req, res) => {
   const { link } = req.body;
 
   if (!link) {
@@ -252,29 +275,65 @@ app.post('/api/cancel', (req, res) => {
   }
 
   let cancelledCount = 0;
+  let smmCancelledCount = 0;
+  let smmFailedCount = 0;
+  const cancelResults = [];
 
-  allRuns.forEach(run => {
-    if (run.link === link && !run.done) {
-      run.cancelled = true;
-      run.smmStatus = 'cancelled';
-      cancelledCount++;
+  // Find all runs for this link
+  const runsToCancel = allRuns.filter(run => run.link === link && !run.done);
+
+  for (const run of runsToCancel) {
+    // Mark as cancelled locally
+    run.cancelled = true;
+    run.smmStatus = 'cancelled';
+    cancelledCount++;
+
+    // 🔥 If order was already placed in SMM panel, cancel it there too
+    if (run.smmOrderId) {
+      console.log(`[CANCEL] Cancelling order ${run.smmOrderId} in SMM panel...`);
+      
+      const result = await cancelOrderInSmmPanel({
+        apiUrl: run.apiUrl,
+        apiKey: run.apiKey,
+        orderId: run.smmOrderId,
+      });
+
+      if (result.error) {
+        smmFailedCount++;
+        cancelResults.push({
+          orderId: run.smmOrderId,
+          status: 'failed',
+          error: result.error,
+        });
+      } else {
+        smmCancelledCount++;
+        cancelResults.push({
+          orderId: run.smmOrderId,
+          status: 'cancelled',
+          response: result,
+        });
+      }
     }
-  });
+  }
 
   saveRuns(allRuns);
 
   console.log(`Cancelled ${cancelledCount} runs for link: ${link}`);
+  console.log(`SMM Panel: ${smmCancelledCount} cancelled, ${smmFailedCount} failed`);
 
   return res.json({
     success: true,
     cancelledRuns: cancelledCount,
+    smmPanelCancelled: smmCancelledCount,
+    smmPanelFailed: smmFailedCount,
+    details: cancelResults,
   });
 });
 
 /* =========================
-   🔥 CANCEL INDIVIDUAL RUN BY ID
+   🔥 CANCEL INDIVIDUAL RUN BY ID (WITH SMM PANEL CANCELLATION)
 ========================= */
-app.post('/api/cancel-run', (req, res) => {
+app.post('/api/cancel-run', async (req, res) => {
   const { runId } = req.body;
 
   if (!runId) {
@@ -287,21 +346,43 @@ app.post('/api/cancel-run', (req, res) => {
     return res.status(404).json({ error: 'Run not found' });
   }
 
-  if (!run.done) {
-    run.cancelled = true;
-    run.smmStatus = 'cancelled';
-    saveRuns(allRuns);
-    console.log(`Cancelled run ${runId}`);
+  if (run.done) {
+    return res.json({
+      success: false,
+      message: 'Run already completed',
+    });
   }
+
+  // Mark as cancelled locally
+  run.cancelled = true;
+  run.smmStatus = 'cancelled';
+
+  let smmResult = null;
+
+  // 🔥 If order was placed in SMM panel, cancel it there too
+  if (run.smmOrderId) {
+    console.log(`[CANCEL] Cancelling order ${run.smmOrderId} in SMM panel...`);
+    
+    smmResult = await cancelOrderInSmmPanel({
+      apiUrl: run.apiUrl,
+      apiKey: run.apiKey,
+      orderId: run.smmOrderId,
+    });
+  }
+
+  saveRuns(allRuns);
+
+  console.log(`Cancelled run ${runId}`);
 
   return res.json({
     success: true,
     message: 'Run cancelled',
+    smmPanelResult: smmResult,
   });
 });
 
 /* =========================
-   🔥 GET RUN STATUSES FOR A LINK
+   GET RUN STATUSES FOR A LINK
 ========================= */
 app.post('/api/run-statuses', (req, res) => {
   const { link } = req.body;
@@ -330,11 +411,12 @@ app.post('/api/run-statuses', (req, res) => {
 });
 
 /* =========================
-   🔥 GET ALL RUNS (FOR DEBUGGING)
+   GET ALL RUNS (FOR DEBUGGING)
 ========================= */
 app.get('/api/all-runs', (req, res) => {
   return res.json({
     success: true,
+    total: allRuns.length,
     runs: allRuns,
   });
 });
