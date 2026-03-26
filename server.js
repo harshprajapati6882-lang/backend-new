@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const fs = require('fs');
+const { randomUUID } = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -24,7 +25,11 @@ function loadRuns() {
 }
 
 function saveRuns(runs) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(runs, null, 2));
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify(runs, null, 2));
+  } catch (e) {
+    console.error('[SAVE] Failed to save runs.json:', e.message);
+  }
 }
 
 let allRuns = loadRuns();
@@ -43,13 +48,14 @@ async function placeOrder({ apiUrl, apiKey, service, link, quantity }) {
 
   const response = await axios.post(apiUrl, params.toString(), {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    timeout: 15000,
   });
 
   return response.data;
 }
 
 /* =========================
-   🔥 CANCEL ORDER IN SMM PANEL
+   CANCEL ORDER IN SMM PANEL
 ========================= */
 async function cancelOrderInSmmPanel({ apiUrl, apiKey, orderId }) {
   try {
@@ -61,6 +67,7 @@ async function cancelOrderInSmmPanel({ apiUrl, apiKey, orderId }) {
 
     const response = await axios.post(apiUrl, params.toString(), {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: 15000,
     });
 
     console.log(`[CANCEL] SMM Panel response for order ${orderId}:`, response.data);
@@ -84,6 +91,7 @@ async function checkOrderStatus({ apiUrl, apiKey, orderId }) {
   try {
     const response = await axios.post(apiUrl, params.toString(), {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: 15000,
     });
     return response.data;
   } catch (err) {
@@ -94,75 +102,95 @@ async function checkOrderStatus({ apiUrl, apiKey, orderId }) {
 
 /* =========================
    ADD RUNS TO STORAGE
+   FIX: Accept schedulerOrderId, startDelayHours, name
+        Use randomUUID() for unique IDs
+        Apply startDelayHours offset to every run time
 ========================= */
 function addRuns(services, baseConfig) {
+  const delayMs = (baseConfig.startDelayHours || 0) * 3600 * 1000;
+
   Object.entries(services).forEach(([key, serviceConfig]) => {
     if (!serviceConfig) return;
 
     const label = key.toUpperCase();
 
     serviceConfig.runs.forEach((run) => {
+      // Apply start delay offset to the scheduled run time
+      const originalTime = new Date(run.time).getTime();
+      const scheduledTime = new Date(originalTime + delayMs).toISOString();
+
       allRuns.push({
-        id: Date.now() + Math.random(),
+        id: randomUUID(),                              // FIX: unique ID, no collisions
+        schedulerOrderId: baseConfig.schedulerOrderId, // FIX: link run to parent order
         label,
+        name: baseConfig.name || '',
         apiUrl: baseConfig.apiUrl,
         apiKey: baseConfig.apiKey,
         service: serviceConfig.serviceId,
         link: baseConfig.link,
         quantity: run.quantity,
-        time: run.time,
+        time: scheduledTime,                           // FIX: start delay applied
         done: false,
         cancelled: false,
+        paused: false,
         retryCount: 0,
         isExecuting: false,
         smmOrderId: null,
         smmStatus: 'pending',
+        createdAt: new Date().toISOString(),
       });
     });
   });
 
-  saveRuns(allRuns);
+  saveRuns(allRuns); // FIX: save immediately after adding
 }
 
 /* =========================
    EXECUTE RUN (SAFE + RETRY)
 ========================= */
 async function executeRun(run) {
-  if (run.cancelled || run.done || run.isExecuting) return;
+  if (run.cancelled || run.done || run.isExecuting || run.paused) return;
 
   run.isExecuting = true;
 
   try {
     if (!run.quantity || run.quantity <= 0) {
+      run.done = true;
       run.isExecuting = false;
+      saveRuns(allRuns);
       return;
     }
 
-    console.log(`[${run.label}] Executing`, run);
+    console.log(`[${run.label}] Executing run ${run.id} for link: ${run.link}`);
 
     const result = await placeOrder(run);
 
     if (run.cancelled) {
       run.isExecuting = false;
+      saveRuns(allRuns);
       return;
     }
 
     if (result?.order) {
-      console.log(`[${run.label}] SUCCESS`, result.order);
+      console.log(`[${run.label}] SUCCESS orderId=${result.order}`);
       run.smmOrderId = result.order;
       run.smmStatus = 'processing';
+      saveRuns(allRuns); // FIX: save immediately on success
     } else {
       console.error(`[${run.label}] FAILED`, result);
 
       if (run.retryCount < 3 && !run.cancelled) {
         run.retryCount++;
-        console.log(`[${run.label}] Retrying in 60 sec... Attempt ${run.retryCount}`);
-
+        console.log(`[${run.label}] Retrying in 60s... attempt ${run.retryCount}`);
+        run.isExecuting = false;
+        saveRuns(allRuns);
         setTimeout(() => executeRun(run), 60000);
+        return;
       } else {
         console.error(`[${run.label}] Max retries reached`);
         run.done = true;
         run.smmStatus = 'failed';
+        saveRuns(allRuns);
       }
     }
 
@@ -171,13 +199,16 @@ async function executeRun(run) {
 
     if (run.retryCount < 3 && !run.cancelled) {
       run.retryCount++;
-      console.log(`[${run.label}] Retrying after error... Attempt ${run.retryCount}`);
-
+      console.log(`[${run.label}] Retrying after error... attempt ${run.retryCount}`);
+      run.isExecuting = false;
+      saveRuns(allRuns);
       setTimeout(() => executeRun(run), 60000);
+      return;
     } else {
       console.error(`[${run.label}] Max retries reached after error`);
       run.done = true;
       run.smmStatus = 'failed';
+      saveRuns(allRuns);
     }
   }
 
@@ -188,6 +219,8 @@ async function executeRun(run) {
    CHECK RUN STATUSES FROM SMM PANEL
 ========================= */
 async function checkRunStatuses() {
+  let changed = false;
+
   for (let run of allRuns) {
     if (run.done || run.cancelled || !run.smmOrderId) continue;
 
@@ -200,33 +233,35 @@ async function checkRunStatuses() {
     if (statusData && statusData.status) {
       const smmStatus = statusData.status.toLowerCase();
       run.smmStatus = smmStatus;
+      changed = true;
 
       if (smmStatus === 'completed' || smmStatus === 'complete') {
         run.done = true;
-        console.log(`[${run.label}] Order ${run.smmOrderId} completed in SMM panel`);
+        console.log(`[${run.label}] Order ${run.smmOrderId} completed`);
       } else if (smmStatus === 'canceled' || smmStatus === 'cancelled' || smmStatus === 'refunded') {
         run.done = true;
         run.cancelled = true;
-        console.log(`[${run.label}] Order ${run.smmOrderId} cancelled in SMM panel`);
+        console.log(`[${run.label}] Order ${run.smmOrderId} cancelled`);
       } else if (smmStatus === 'partial') {
         run.done = true;
         run.smmStatus = 'partial';
-        console.log(`[${run.label}] Order ${run.smmOrderId} partial in SMM panel`);
+        console.log(`[${run.label}] Order ${run.smmOrderId} partial`);
       }
     }
   }
 
-  saveRuns(allRuns);
+  if (changed) saveRuns(allRuns);
 }
 
 /* =========================
    MAIN SCHEDULER
+   FIX: Tightened to 3s for better run-time accuracy
 ========================= */
 setInterval(async () => {
   const now = Date.now();
 
   for (let run of allRuns) {
-    if (run.done || run.cancelled) continue;
+    if (run.done || run.cancelled || run.paused) continue;
 
     const runTime = new Date(run.time).getTime();
 
@@ -235,9 +270,7 @@ setInterval(async () => {
     }
   }
 
-  saveRuns(allRuns);
-
-}, 10000);
+}, 3000); // FIX: was 10000ms — tighter scheduling
 
 // Check SMM panel statuses every 30 seconds
 setInterval(async () => {
@@ -246,26 +279,123 @@ setInterval(async () => {
 
 /* =========================
    CREATE ORDER
+   FIX: Generate and return schedulerOrderId
+        Accept + store name and startDelayHours
 ========================= */
 app.post('/api/order', async (req, res) => {
-  const { apiUrl, apiKey, link, services } = req.body;
+  const { apiUrl, apiKey, link, services, name, startDelayHours } = req.body;
 
   if (!apiUrl || !apiKey || !link || !services) {
-    return res.status(400).json({ error: 'Missing required fields' });
+    return res.status(400).json({ error: 'Missing required fields: apiUrl, apiKey, link, services' });
   }
 
-  console.log('Saving runs for scheduler');
+  // Validate services object
+  if (typeof services !== 'object' || Array.isArray(services)) {
+    return res.status(400).json({ error: 'services must be an object' });
+  }
 
-  addRuns(services, { apiUrl, apiKey, link });
+  // FIX: Generate a unique schedulerOrderId to track this order
+  const schedulerOrderId = `SCHED-${Date.now()}-${randomUUID().slice(0, 8)}`;
+
+  console.log(`[ORDER] Creating order schedulerOrderId=${schedulerOrderId} link=${link}`);
+
+  addRuns(services, {
+    apiUrl,
+    apiKey,
+    link,
+    name: name || '',
+    startDelayHours: Number(startDelayHours) || 0, // FIX: pass delay so runs are offset
+    schedulerOrderId,
+  });
+
+  const runCount = Object.values(services).reduce((acc, svc) => {
+    return acc + (svc?.runs?.length || 0);
+  }, 0);
 
   return res.json({
     success: true,
-    message: 'Order scheduled (persistent)',
+    schedulerOrderId,   // FIX: return so frontend can track/control this order
+    message: `Order scheduled — ${runCount} run(s) queued`,
+    runCount,
   });
 });
 
 /* =========================
-   🔥 CANCEL ALL RUNS FOR A LINK (WITH SMM PANEL CANCELLATION)
+   ORDER CONTROL (pause / resume / cancel)
+   FIX: This endpoint was completely missing — frontend api.ts calls it
+========================= */
+app.post('/api/order/control', async (req, res) => {
+  const { schedulerOrderId, action } = req.body;
+
+  if (!schedulerOrderId || !action) {
+    return res.status(400).json({ error: 'Missing schedulerOrderId or action' });
+  }
+
+  if (!['pause', 'resume', 'cancel'].includes(action)) {
+    return res.status(400).json({ error: 'action must be pause, resume, or cancel' });
+  }
+
+  const orderRuns = allRuns.filter(r => r.schedulerOrderId === schedulerOrderId);
+
+  if (!orderRuns.length) {
+    return res.status(404).json({ error: 'No runs found for this schedulerOrderId' });
+  }
+
+  let smmCancelCount = 0;
+  let smmFailCount = 0;
+
+  for (const run of orderRuns) {
+    if (run.done) continue;
+
+    if (action === 'pause') {
+      run.paused = true;
+      run.smmStatus = 'paused';
+    } else if (action === 'resume') {
+      run.paused = false;
+      if (run.smmStatus === 'paused') run.smmStatus = 'pending';
+    } else if (action === 'cancel') {
+      run.cancelled = true;
+      run.paused = false;
+      run.smmStatus = 'cancelled';
+
+      // Also cancel in SMM panel if already placed
+      if (run.smmOrderId) {
+        const result = await cancelOrderInSmmPanel({
+          apiUrl: run.apiUrl,
+          apiKey: run.apiKey,
+          orderId: run.smmOrderId,
+        });
+        if (result.error) smmFailCount++;
+        else smmCancelCount++;
+      }
+    }
+  }
+
+  saveRuns(allRuns);
+
+  const completedRuns = orderRuns.filter(r => r.done && !r.cancelled).length;
+  const runStatuses = orderRuns.map(r => {
+    if (r.cancelled) return 'cancelled';
+    if (r.done) return 'completed';
+    return 'pending';
+  });
+
+  const statusMap = { pause: 'paused', resume: 'running', cancel: 'cancelled' };
+
+  console.log(`[CONTROL] ${action} on schedulerOrderId=${schedulerOrderId} — ${orderRuns.length} runs affected`);
+
+  return res.json({
+    success: true,
+    status: statusMap[action],
+    completedRuns,
+    runStatuses,
+    smmPanelCancelled: smmCancelCount,
+    smmPanelFailed: smmFailCount,
+  });
+});
+
+/* =========================
+   CANCEL ALL RUNS FOR A LINK (legacy — kept for compatibility)
 ========================= */
 app.post('/api/cancel', async (req, res) => {
   const { link } = req.body;
@@ -279,19 +409,14 @@ app.post('/api/cancel', async (req, res) => {
   let smmFailedCount = 0;
   const cancelResults = [];
 
-  // Find all runs for this link
-  const runsToCancel = allRuns.filter(run => run.link === link && !run.done);
+  const runsToCancel = allRuns.filter(run => run.link === link && !run.done && !run.cancelled);
 
   for (const run of runsToCancel) {
-    // Mark as cancelled locally
     run.cancelled = true;
     run.smmStatus = 'cancelled';
     cancelledCount++;
 
-    // 🔥 If order was already placed in SMM panel, cancel it there too
     if (run.smmOrderId) {
-      console.log(`[CANCEL] Cancelling order ${run.smmOrderId} in SMM panel...`);
-      
       const result = await cancelOrderInSmmPanel({
         apiUrl: run.apiUrl,
         apiKey: run.apiKey,
@@ -300,26 +425,17 @@ app.post('/api/cancel', async (req, res) => {
 
       if (result.error) {
         smmFailedCount++;
-        cancelResults.push({
-          orderId: run.smmOrderId,
-          status: 'failed',
-          error: result.error,
-        });
+        cancelResults.push({ orderId: run.smmOrderId, status: 'failed', error: result.error });
       } else {
         smmCancelledCount++;
-        cancelResults.push({
-          orderId: run.smmOrderId,
-          status: 'cancelled',
-          response: result,
-        });
+        cancelResults.push({ orderId: run.smmOrderId, status: 'cancelled', response: result });
       }
     }
   }
 
   saveRuns(allRuns);
 
-  console.log(`Cancelled ${cancelledCount} runs for link: ${link}`);
-  console.log(`SMM Panel: ${smmCancelledCount} cancelled, ${smmFailedCount} failed`);
+  console.log(`[CANCEL] Cancelled ${cancelledCount} runs for link: ${link}`);
 
   return res.json({
     success: true,
@@ -331,7 +447,7 @@ app.post('/api/cancel', async (req, res) => {
 });
 
 /* =========================
-   🔥 CANCEL INDIVIDUAL RUN BY ID (WITH SMM PANEL CANCELLATION)
+   CANCEL INDIVIDUAL RUN BY ID
 ========================= */
 app.post('/api/cancel-run', async (req, res) => {
   const { runId } = req.body;
@@ -347,22 +463,15 @@ app.post('/api/cancel-run', async (req, res) => {
   }
 
   if (run.done) {
-    return res.json({
-      success: false,
-      message: 'Run already completed',
-    });
+    return res.json({ success: false, message: 'Run already completed' });
   }
 
-  // Mark as cancelled locally
   run.cancelled = true;
   run.smmStatus = 'cancelled';
 
   let smmResult = null;
 
-  // 🔥 If order was placed in SMM panel, cancel it there too
   if (run.smmOrderId) {
-    console.log(`[CANCEL] Cancelling order ${run.smmOrderId} in SMM panel...`);
-    
     smmResult = await cancelOrderInSmmPanel({
       apiUrl: run.apiUrl,
       apiKey: run.apiKey,
@@ -372,7 +481,7 @@ app.post('/api/cancel-run', async (req, res) => {
 
   saveRuns(allRuns);
 
-  console.log(`Cancelled run ${runId}`);
+  console.log(`[CANCEL-RUN] Cancelled run ${runId}`);
 
   return res.json({
     success: true,
@@ -382,16 +491,29 @@ app.post('/api/cancel-run', async (req, res) => {
 });
 
 /* =========================
-   GET RUN STATUSES FOR A LINK
+   GET RUN STATUSES FOR A LINK OR schedulerOrderId
+   FIX: Also support schedulerOrderId lookup
 ========================= */
 app.post('/api/run-statuses', (req, res) => {
-  const { link } = req.body;
+  const { link, schedulerOrderId } = req.body;
 
-  if (!link) {
-    return res.status(400).json({ error: 'Missing link' });
+  if (!link && !schedulerOrderId) {
+    return res.status(400).json({ error: 'Missing link or schedulerOrderId' });
   }
 
-  const orderRuns = allRuns.filter(run => run.link === link);
+  const orderRuns = schedulerOrderId
+    ? allRuns.filter(run => run.schedulerOrderId === schedulerOrderId)
+    : allRuns.filter(run => run.link === link);
+
+  const completedRuns = orderRuns.filter(r => r.done && !r.cancelled).length;
+
+  const overallStatus = (() => {
+    if (orderRuns.every(r => r.done && !r.cancelled)) return 'completed';
+    if (orderRuns.every(r => r.cancelled)) return 'cancelled';
+    if (orderRuns.some(r => r.paused)) return 'paused';
+    if (orderRuns.some(r => !r.done && !r.cancelled)) return 'running';
+    return 'completed';
+  })();
 
   const statuses = orderRuns.map(run => ({
     id: run.id,
@@ -400,18 +522,22 @@ app.post('/api/run-statuses', (req, res) => {
     quantity: run.quantity,
     done: run.done,
     cancelled: run.cancelled,
+    paused: run.paused || false,
     smmOrderId: run.smmOrderId,
     smmStatus: run.smmStatus || 'pending',
   }));
 
   return res.json({
     success: true,
+    status: overallStatus,
+    completedRuns,
+    totalRuns: orderRuns.length,
     runs: statuses,
   });
 });
 
 /* =========================
-   GET ALL RUNS (FOR DEBUGGING)
+   GET ALL RUNS (DEBUG)
 ========================= */
 app.get('/api/all-runs', (req, res) => {
   return res.json({
@@ -419,6 +545,16 @@ app.get('/api/all-runs', (req, res) => {
     total: allRuns.length,
     runs: allRuns,
   });
+});
+
+/* =========================
+   DELETE COMPLETED / CANCELLED RUNS (CLEANUP)
+========================= */
+app.post('/api/cleanup', (req, res) => {
+  const before = allRuns.length;
+  allRuns = allRuns.filter(r => !r.done && !r.cancelled);
+  saveRuns(allRuns);
+  return res.json({ success: true, removed: before - allRuns.length, remaining: allRuns.length });
 });
 
 /* =========================
@@ -439,6 +575,7 @@ app.post('/api/services', async (req, res) => {
 
     const response = await axios.post(apiUrl, params.toString(), {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: 20000,
     });
 
     return res.json(response.data);
@@ -450,18 +587,31 @@ app.post('/api/services', async (req, res) => {
 });
 
 /* =========================
+   HEALTH CHECK
+========================= */
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    totalRuns: allRuns.length,
+    pendingRuns: allRuns.filter(r => !r.done && !r.cancelled).length,
+    uptime: process.uptime(),
+  });
+});
+
+/* =========================
    START SERVER
 ========================= */
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`Loaded ${allRuns.length} runs from disk`);
 });
 
 /* =========================
-   KEEP SERVER ALIVE
+   KEEP SERVER ALIVE (self-ping)
 ========================= */
 setInterval(async () => {
   try {
-    await axios.get("https://backend-new-6tzb.onrender.com");
-    console.log("Self-ping to keep server alive");
+    await axios.get(`http://localhost:${PORT}/health`);
+    console.log('[PING] Self-ping ok');
   } catch (e) {}
 }, 5 * 60 * 1000);
