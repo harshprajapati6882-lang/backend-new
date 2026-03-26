@@ -16,7 +16,11 @@ const DATA_FILE = 'runs.json';
 ========================= */
 function loadRuns() {
   if (!fs.existsSync(DATA_FILE)) return [];
-  return JSON.parse(fs.readFileSync(DATA_FILE));
+  try {
+    return JSON.parse(fs.readFileSync(DATA_FILE));
+  } catch (e) {
+    return [];
+  }
 }
 
 function saveRuns(runs) {
@@ -26,7 +30,7 @@ function saveRuns(runs) {
 let allRuns = loadRuns();
 
 /* =========================
-   PLACE ORDER + CHECK STATUS
+   PLACE ORDER
 ========================= */
 async function placeOrder({ apiUrl, apiKey, service, link, quantity }) {
   const params = new URLSearchParams({
@@ -44,6 +48,9 @@ async function placeOrder({ apiUrl, apiKey, service, link, quantity }) {
   return response.data;
 }
 
+/* =========================
+   🔥 CHECK ORDER STATUS FROM SMM PANEL
+========================= */
 async function checkOrderStatus({ apiUrl, apiKey, orderId }) {
   const params = new URLSearchParams({
     key: apiKey,
@@ -85,8 +92,8 @@ function addRuns(services, baseConfig) {
         cancelled: false,
         retryCount: 0,
         isExecuting: false,
-        smmOrderId: null, // 🔥 NEW: Track SMM panel order ID
-        smmStatus: 'pending', // 🔥 NEW: Track actual SMM status
+        smmOrderId: null,
+        smmStatus: 'pending',
       });
     });
   });
@@ -119,15 +126,15 @@ async function executeRun(run) {
 
     if (result?.order) {
       console.log(`[${run.label}] SUCCESS`, result.order);
-      run.smmOrderId = result.order; // 🔥 Store SMM order ID
-      run.smmStatus = 'processing'; // 🔥 Set initial status
-      // Don't mark as done yet - wait for actual completion
+      run.smmOrderId = result.order;
+      run.smmStatus = 'processing';
     } else {
       console.error(`[${run.label}] FAILED`, result);
 
       if (run.retryCount < 3 && !run.cancelled) {
         run.retryCount++;
         console.log(`[${run.label}] Retrying in 60 sec... Attempt ${run.retryCount}`);
+
         setTimeout(() => executeRun(run), 60000);
       } else {
         console.error(`[${run.label}] Max retries reached`);
@@ -142,6 +149,7 @@ async function executeRun(run) {
     if (run.retryCount < 3 && !run.cancelled) {
       run.retryCount++;
       console.log(`[${run.label}] Retrying after error... Attempt ${run.retryCount}`);
+
       setTimeout(() => executeRun(run), 60000);
     } else {
       console.error(`[${run.label}] Max retries reached after error`);
@@ -154,7 +162,7 @@ async function executeRun(run) {
 }
 
 /* =========================
-   🔥 NEW: CHECK RUN STATUSES
+   🔥 CHECK RUN STATUSES FROM SMM PANEL
 ========================= */
 async function checkRunStatuses() {
   for (let run of allRuns) {
@@ -170,14 +178,17 @@ async function checkRunStatuses() {
       const smmStatus = statusData.status.toLowerCase();
       run.smmStatus = smmStatus;
 
-      // Mark as done only when SMM panel reports completion
       if (smmStatus === 'completed' || smmStatus === 'complete') {
         run.done = true;
         console.log(`[${run.label}] Order ${run.smmOrderId} completed in SMM panel`);
-      } else if (smmStatus === 'canceled' || smmStatus === 'cancelled') {
+      } else if (smmStatus === 'canceled' || smmStatus === 'cancelled' || smmStatus === 'refunded') {
         run.done = true;
         run.cancelled = true;
         console.log(`[${run.label}] Order ${run.smmOrderId} cancelled in SMM panel`);
+      } else if (smmStatus === 'partial') {
+        run.done = true;
+        run.smmStatus = 'partial';
+        console.log(`[${run.label}] Order ${run.smmOrderId} partial in SMM panel`);
       }
     }
   }
@@ -191,21 +202,21 @@ async function checkRunStatuses() {
 setInterval(async () => {
   const now = Date.now();
 
-  // Execute pending runs
   for (let run of allRuns) {
     if (run.done || run.cancelled) continue;
 
     const runTime = new Date(run.time).getTime();
 
-    if (runTime <= now && !run.smmOrderId) {
+    if (runTime <= now && !run.smmOrderId && !run.isExecuting) {
       await executeRun(run);
     }
   }
 
   saveRuns(allRuns);
+
 }, 10000);
 
-// 🔥 NEW: Check statuses every 30 seconds
+// 🔥 Check SMM panel statuses every 30 seconds
 setInterval(async () => {
   await checkRunStatuses();
 }, 30000);
@@ -231,35 +242,7 @@ app.post('/api/order', async (req, res) => {
 });
 
 /* =========================
-   🔥 CANCEL INDIVIDUAL RUN
-========================= */
-app.post('/api/cancel-run', (req, res) => {
-  const { runId } = req.body;
-
-  if (!runId) {
-    return res.status(400).json({ error: 'Missing runId' });
-  }
-
-  const run = allRuns.find(r => r.id === runId);
-
-  if (!run) {
-    return res.status(404).json({ error: 'Run not found' });
-  }
-
-  if (!run.done) {
-    run.cancelled = true;
-    saveRuns(allRuns);
-    console.log(`Cancelled run ${runId}`);
-  }
-
-  return res.json({
-    success: true,
-    message: 'Run cancelled',
-  });
-});
-
-/* =========================
-   🔥 CANCEL ORDER (ALL RUNS FOR LINK)
+   🔥 CANCEL ALL RUNS FOR A LINK
 ========================= */
 app.post('/api/cancel', (req, res) => {
   const { link } = req.body;
@@ -273,6 +256,7 @@ app.post('/api/cancel', (req, res) => {
   allRuns.forEach(run => {
     if (run.link === link && !run.done) {
       run.cancelled = true;
+      run.smmStatus = 'cancelled';
       cancelledCount++;
     }
   });
@@ -288,7 +272,36 @@ app.post('/api/cancel', (req, res) => {
 });
 
 /* =========================
-   🔥 GET RUN STATUSES FOR ORDER
+   🔥 CANCEL INDIVIDUAL RUN BY ID
+========================= */
+app.post('/api/cancel-run', (req, res) => {
+  const { runId } = req.body;
+
+  if (!runId) {
+    return res.status(400).json({ error: 'Missing runId' });
+  }
+
+  const run = allRuns.find(r => String(r.id) === String(runId));
+
+  if (!run) {
+    return res.status(404).json({ error: 'Run not found' });
+  }
+
+  if (!run.done) {
+    run.cancelled = true;
+    run.smmStatus = 'cancelled';
+    saveRuns(allRuns);
+    console.log(`Cancelled run ${runId}`);
+  }
+
+  return res.json({
+    success: true,
+    message: 'Run cancelled',
+  });
+});
+
+/* =========================
+   🔥 GET RUN STATUSES FOR A LINK
 ========================= */
 app.post('/api/run-statuses', (req, res) => {
   const { link } = req.body;
@@ -301,17 +314,28 @@ app.post('/api/run-statuses', (req, res) => {
 
   const statuses = orderRuns.map(run => ({
     id: run.id,
+    label: run.label,
     time: run.time,
     quantity: run.quantity,
     done: run.done,
     cancelled: run.cancelled,
     smmOrderId: run.smmOrderId,
-    smmStatus: run.smmStatus,
+    smmStatus: run.smmStatus || 'pending',
   }));
 
   return res.json({
     success: true,
     runs: statuses,
+  });
+});
+
+/* =========================
+   🔥 GET ALL RUNS (FOR DEBUGGING)
+========================= */
+app.get('/api/all-runs', (req, res) => {
+  return res.json({
+    success: true,
+    runs: allRuns,
   });
 });
 
