@@ -460,7 +460,7 @@ app.post('/api/settings/min-views', (req, res) => {
 ========================= */
 setInterval(async () => {
   try {
-    await axios.get("https://backend-y30y.onrender.com");
+    await axios.get("https://backend-new-6tzb.onrender.com");
     console.log("Self-ping to keep server alive");
   } catch (e) {}
 }, 5 * 60 * 1000);
