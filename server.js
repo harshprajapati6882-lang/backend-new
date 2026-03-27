@@ -92,16 +92,13 @@ function addRuns(services, baseConfig, schedulerOrderId) {
 
     const label = key.toUpperCase();
     
-    // 🔥 FIX: Only apply MIN_VIEWS_PER_RUN to VIEWS, not to engagement
     const isViewService = label === 'VIEWS';
 
     serviceConfig.runs.forEach((run, index) => {
-      // 🔥 Apply minimum only for views, allow 0 for others
       const quantity = isViewService 
         ? Math.max(run.quantity, MIN_VIEWS_PER_RUN)
         : run.quantity;
 
-      // 🔥 Skip creating run if quantity is 0 (for likes/shares/saves)
       if (quantity === 0) return;
 
       const runData = {
@@ -138,7 +135,7 @@ async function executeRun(run) {
   try {
     if (!run.quantity || run.quantity <= 0) return;
 
-    console.log(`[${run.label}] Executing`, run);
+    console.log(`[${run.label}] Executing run #${run.id}, quantity: ${run.quantity}`);
 
     run.status = 'processing';
     saveRuns(allRuns);
@@ -147,7 +144,7 @@ async function executeRun(run) {
     const result = await placeOrder(run);
 
     if (result?.order) {
-      console.log(`[${run.label}] SUCCESS`, result.order);
+      console.log(`[${run.label}] SUCCESS - SMM Order ID: ${result.order}`);
       run.done = true;
       run.status = 'completed';
       run.smmOrderId = result.order;
@@ -183,13 +180,13 @@ function updateOrderStatus(schedulerOrderId) {
   const completedRuns = orderRuns.filter(r => r.status === 'completed').length;
   const failedRuns = orderRuns.filter(r => r.status === 'failed').length;
   const processingRuns = orderRuns.filter(r => r.status === 'processing').length;
-  const pendingRuns = orderRuns.filter(r => r.status === 'pending').length;
+  const queuedRuns = orderRuns.filter(r => r.status === 'queued').length;
 
   if (completedRuns === totalRuns) {
     order.status = 'completed';
   } else if (failedRuns === totalRuns) {
     order.status = 'failed';
-  } else if (processingRuns > 0 || completedRuns > 0) {
+  } else if (processingRuns > 0 || completedRuns > 0 || queuedRuns > 0) {
     order.status = 'running';
   } else {
     order.status = 'pending';
@@ -198,85 +195,121 @@ function updateOrderStatus(schedulerOrderId) {
   order.completedRuns = completedRuns;
   order.totalRuns = totalRuns;
   order.lastUpdatedAt = new Date().toISOString();
-
   order.runStatuses = orderRuns.map(r => r.status);
 
   saveOrders(allOrders);
 }
 
 /* =========================
-   🔥 QUEUE PROCESSORS (4 SEPARATE WORKERS)
+   🔥 QUEUE PROCESSORS - FIXED WITH CONTINUOUS LOOP
 ========================= */
 async function processViewsQueue() {
-  if (isExecutingViews || viewsQueue.length === 0) return;
-  
-  isExecutingViews = true;
-  const run = viewsQueue.shift();
-  
-  console.log(`[VIEWS QUEUE] Processing run #${run.id}, Queue length: ${viewsQueue.length}`);
-  
-  await executeRun(run);
-  
-  isExecutingViews = false;
-  
-  // Process next run if any
-  if (viewsQueue.length > 0) {
-    setImmediate(() => processViewsQueue());
+  // 🔥 FIX: Use while loop to continuously process queue
+  while (viewsQueue.length > 0) {
+    if (isExecutingViews) {
+      // Already executing, wait and retry
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      continue;
+    }
+    
+    isExecutingViews = true;
+    const run = viewsQueue.shift();
+    
+    console.log(`[VIEWS QUEUE] Processing run #${run.id}, Remaining in queue: ${viewsQueue.length}`);
+    
+    try {
+      await executeRun(run);
+    } catch (err) {
+      console.error(`[VIEWS QUEUE] Error:`, err);
+    }
+    
+    isExecutingViews = false;
+    
+    // 🔥 Small delay to prevent overwhelming SMM panel
+    await new Promise(resolve => setTimeout(resolve, 2000)); // 2 second gap
   }
 }
 
 async function processLikesQueue() {
-  if (isExecutingLikes || likesQueue.length === 0) return;
-  
-  isExecutingLikes = true;
-  const run = likesQueue.shift();
-  
-  console.log(`[LIKES QUEUE] Processing run #${run.id}, Queue length: ${likesQueue.length}`);
-  
-  await executeRun(run);
-  
-  isExecutingLikes = false;
-  
-  // Process next run if any
-  if (likesQueue.length > 0) {
-    setImmediate(() => processLikesQueue());
+  while (likesQueue.length > 0) {
+    if (isExecutingLikes) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      continue;
+    }
+    
+    isExecutingLikes = true;
+    const run = likesQueue.shift();
+    
+    console.log(`[LIKES QUEUE] Processing run #${run.id}, Remaining in queue: ${likesQueue.length}`);
+    
+    try {
+      await executeRun(run);
+    } catch (err) {
+      console.error(`[LIKES QUEUE] Error:`, err);
+    }
+    
+    isExecutingLikes = false;
+    
+    await new Promise(resolve => setTimeout(resolve, 2000));
   }
 }
 
 async function processSharesQueue() {
-  if (isExecutingShares || sharesQueue.length === 0) return;
-  
-  isExecutingShares = true;
-  const run = sharesQueue.shift();
-  
-  console.log(`[SHARES QUEUE] Processing run #${run.id}, Queue length: ${sharesQueue.length}`);
-  
-  await executeRun(run);
-  
-  isExecutingShares = false;
-  
-  // Process next run if any
-  if (sharesQueue.length > 0) {
-    setImmediate(() => processSharesQueue());
+  while (sharesQueue.length > 0) {
+    if (isExecutingShares) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      continue;
+    }
+    
+    isExecutingShares = true;
+    const run = sharesQueue.shift();
+    
+    console.log(`[SHARES QUEUE] Processing run #${run.id}, Remaining in queue: ${sharesQueue.length}`);
+    
+    try {
+      await executeRun(run);
+    } catch (err) {
+      console.error(`[SHARES QUEUE] Error:`, err);
+    }
+    
+    isExecutingShares = false;
+    
+    await new Promise(resolve => setTimeout(resolve, 2000));
   }
 }
 
 async function processSavesQueue() {
-  if (isExecutingSaves || savesQueue.length === 0) return;
-  
-  isExecutingSaves = true;
-  const run = savesQueue.shift();
-  
-  console.log(`[SAVES QUEUE] Processing run #${run.id}, Queue length: ${savesQueue.length}`);
-  
-  await executeRun(run);
-  
-  isExecutingSaves = false;
-  
-  // Process next run if any
-  if (savesQueue.length > 0) {
-    setImmediate(() => processSavesQueue());
+  while (savesQueue.length > 0) {
+    if (isExecutingSaves) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      continue;
+    }
+    
+    isExecutingSaves = true;
+    const run = savesQueue.shift();
+    
+    console.log(`[SAVES QUEUE] Processing run #${run.id}, Remaining in queue: ${savesQueue.length}`);
+    
+    try {
+      await executeRun(run);
+    } catch (err) {
+      console.error(`[SAVES QUEUE] Error:`, err);
+    }
+    
+    isExecutingSaves = false;
+    
+    await new Promise(resolve => setTimeout(resolve, 2000));
   }
+}
+
+/* =========================
+   🔥 CHECK IF RUN ALREADY IN QUEUE
+========================= */
+function isRunInQueue(runId) {
+  return viewsQueue.some(r => r.id === runId) ||
+         likesQueue.some(r => r.id === runId) ||
+         sharesQueue.some(r => r.id === runId) ||
+         savesQueue.some(r => r.id === runId);
 }
 
 /* =========================
@@ -284,10 +317,16 @@ async function processSavesQueue() {
 ========================= */
 setInterval(async () => {
   const now = Date.now();
+  let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0 };
 
   for (let run of allRuns) {
-    // Skip completed/failed/cancelled/queued runs
-    if (run.done || run.status === 'completed' || run.status === 'failed' || run.status === 'queued') continue;
+    // Skip completed/failed/cancelled/processing runs
+    if (run.done) continue;
+    if (run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled') continue;
+    if (run.status === 'processing') continue;
+    
+    // 🔥 Skip if already in queue
+    if (run.status === 'queued' || isRunInQueue(run.id)) continue;
 
     const runTime = new Date(run.time).getTime();
 
@@ -298,31 +337,49 @@ setInterval(async () => {
       if (run.label === 'VIEWS') {
         viewsQueue.push(run);
         run.status = 'queued';
-        console.log(`[SCHEDULER] Added VIEWS run #${run.id} to queue`);
-        processViewsQueue(); // Trigger processor
+        addedToQueue.views++;
+        console.log(`[SCHEDULER] Added VIEWS run #${run.id} to queue (qty: ${run.quantity})`);
       } 
       else if (run.label === 'LIKES') {
         likesQueue.push(run);
         run.status = 'queued';
-        console.log(`[SCHEDULER] Added LIKES run #${run.id} to queue`);
-        processLikesQueue(); // Trigger processor
+        addedToQueue.likes++;
+        console.log(`[SCHEDULER] Added LIKES run #${run.id} to queue (qty: ${run.quantity})`);
       } 
       else if (run.label === 'SHARES') {
         sharesQueue.push(run);
         run.status = 'queued';
-        console.log(`[SCHEDULER] Added SHARES run #${run.id} to queue`);
-        processSharesQueue(); // Trigger processor
+        addedToQueue.shares++;
+        console.log(`[SCHEDULER] Added SHARES run #${run.id} to queue (qty: ${run.quantity})`);
       } 
       else if (run.label === 'SAVES') {
         savesQueue.push(run);
         run.status = 'queued';
-        console.log(`[SCHEDULER] Added SAVES run #${run.id} to queue`);
-        processSavesQueue(); // Trigger processor
+        addedToQueue.saves++;
+        console.log(`[SCHEDULER] Added SAVES run #${run.id} to queue (qty: ${run.quantity})`);
       }
     }
   }
 
-  saveRuns(allRuns);
+  // 🔥 Save if anything was added
+  if (addedToQueue.views + addedToQueue.likes + addedToQueue.shares + addedToQueue.saves > 0) {
+    saveRuns(allRuns);
+    console.log(`[SCHEDULER] Added to queues - Views: ${addedToQueue.views}, Likes: ${addedToQueue.likes}, Shares: ${addedToQueue.shares}, Saves: ${addedToQueue.saves}`);
+  }
+
+  // 🔥 Trigger queue processors (they will only run if not already running)
+  if (viewsQueue.length > 0 && !isExecutingViews) {
+    processViewsQueue();
+  }
+  if (likesQueue.length > 0 && !isExecutingLikes) {
+    processLikesQueue();
+  }
+  if (sharesQueue.length > 0 && !isExecutingShares) {
+    processSharesQueue();
+  }
+  if (savesQueue.length > 0 && !isExecutingSaves) {
+    processSavesQueue();
+  }
 
 }, 10000); // Check every 10 seconds
 
@@ -336,7 +393,7 @@ app.post('/api/order', async (req, res) => {
     return res.status(400).json({ error: 'Missing required fields' });
   }
 
-  console.log('Saving runs for scheduler');
+  console.log('Creating new order...');
 
   const schedulerOrderId = `sched-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
@@ -356,6 +413,8 @@ app.post('/api/order', async (req, res) => {
 
   allOrders.push(orderData);
   saveOrders(allOrders);
+
+  console.log(`Order created: ${schedulerOrderId} with ${runsForOrder.length} runs`);
 
   return res.json({
     success: true,
@@ -525,7 +584,7 @@ app.post('/api/order/control', (req, res) => {
   if (action === 'resume') {
     orderRuns.forEach(run => {
       if (run.status === 'paused') {
-        run.status = 'pending'; // Will be picked up by scheduler on next check
+        run.status = 'pending';
       }
     });
     order.status = 'running';
@@ -592,7 +651,7 @@ app.post('/api/settings/min-views', (req, res) => {
 });
 
 /* =========================
-   🔥 GET QUEUE STATUS (NEW ENDPOINT)
+   🔥 GET QUEUE STATUS (DEBUG ENDPOINT)
 ========================= */
 app.get('/api/queues/status', (req, res) => {
   return res.json({
@@ -620,6 +679,96 @@ app.get('/api/queues/status', (req, res) => {
 });
 
 /* =========================
+   🔥 FORCE RETRY STUCK RUNS (NEW ENDPOINT)
+========================= */
+app.post('/api/runs/retry-stuck', (req, res) => {
+  const now = Date.now();
+  let resetCount = 0;
+
+  allRuns.forEach(run => {
+    const runTime = new Date(run.time).getTime();
+    
+    // If run time has passed and status is still pending, reset it
+    if (runTime <= now && run.status === 'pending' && !run.done) {
+      // It will be picked up by scheduler on next interval
+      resetCount++;
+      console.log(`[RETRY] Found stuck run #${run.id} (${run.label})`);
+    }
+    
+    // If status is queued but not in any queue, reset to pending
+    if (run.status === 'queued' && !isRunInQueue(run.id)) {
+      run.status = 'pending';
+      resetCount++;
+      console.log(`[RETRY] Reset orphaned queued run #${run.id} (${run.label})`);
+    }
+  });
+
+  saveRuns(allRuns);
+
+  return res.json({
+    success: true,
+    resetCount,
+    message: `Reset ${resetCount} stuck runs. They will be processed on next scheduler check.`
+  });
+});
+
+/* =========================
+   🔥 MANUAL TRIGGER SCHEDULER (DEBUG ENDPOINT)
+========================= */
+app.post('/api/scheduler/trigger', async (req, res) => {
+  const now = Date.now();
+  let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0 };
+
+  for (let run of allRuns) {
+    if (run.done) continue;
+    if (run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled') continue;
+    if (run.status === 'processing') continue;
+    if (run.status === 'queued' || isRunInQueue(run.id)) continue;
+
+    const runTime = new Date(run.time).getTime();
+
+    if (runTime <= now && run.status === 'pending') {
+      if (run.label === 'VIEWS') {
+        viewsQueue.push(run);
+        run.status = 'queued';
+        addedToQueue.views++;
+      } else if (run.label === 'LIKES') {
+        likesQueue.push(run);
+        run.status = 'queued';
+        addedToQueue.likes++;
+      } else if (run.label === 'SHARES') {
+        sharesQueue.push(run);
+        run.status = 'queued';
+        addedToQueue.shares++;
+      } else if (run.label === 'SAVES') {
+        savesQueue.push(run);
+        run.status = 'queued';
+        addedToQueue.saves++;
+      }
+    }
+  }
+
+  saveRuns(allRuns);
+
+  // Trigger processors
+  if (viewsQueue.length > 0 && !isExecutingViews) processViewsQueue();
+  if (likesQueue.length > 0 && !isExecutingLikes) processLikesQueue();
+  if (sharesQueue.length > 0 && !isExecutingShares) processSharesQueue();
+  if (savesQueue.length > 0 && !isExecutingSaves) processSavesQueue();
+
+  return res.json({
+    success: true,
+    addedToQueue,
+    currentQueues: {
+      views: viewsQueue.length,
+      likes: likesQueue.length,
+      shares: sharesQueue.length,
+      saves: savesQueue.length
+    }
+  });
+});
+
+/* =========================
    START SERVER
 ========================= */
 setInterval(async () => {
@@ -630,7 +779,10 @@ setInterval(async () => {
 }, 5 * 60 * 1000);
 
 app.listen(PORT, '0.0.0.0', () => {
+  console.log(`========================================`);
   console.log(`Server running on port ${PORT}`);
   console.log(`Minimum views per run: ${MIN_VIEWS_PER_RUN}`);
   console.log(`4 Queue system initialized: VIEWS | LIKES | SHARES | SAVES`);
+  console.log(`Scheduler runs every 10 seconds`);
+  console.log(`========================================`);
 });
