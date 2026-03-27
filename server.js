@@ -10,16 +10,13 @@ app.use(cors());
 app.use(express.json());
 
 /* =========================
-   🔥 MONGODB CONNECTION
+   🔥 MONGODB CONNECTION - FIXED
 ========================= */
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://harshprajapati6882_db_user:mbyjv1uPdKtLBz1l@devanush.tqknxqf.mongodb.net/smm-panel?retryWrites=true&w=majority';
 
-mongoose.connect(MONGODB_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-})
-.then(() => console.log('✅ MongoDB Connected Successfully'))
-.catch(err => console.error('❌ MongoDB Connection Error:', err));
+mongoose.connect(MONGODB_URI)
+  .then(() => console.log('✅ MongoDB Connected Successfully'))
+  .catch(err => console.error('❌ MongoDB Connection Error:', err));
 
 /* =========================
    🔥 MONGODB SCHEMAS
@@ -316,102 +313,110 @@ function isRunInQueue(runId) {
    🔥 MAIN SCHEDULER
 ========================= */
 setInterval(async () => {
-  const now = Date.now();
-  let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0 };
+  try {
+    const now = Date.now();
+    let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0 };
 
-  const allRuns = await Run.find({ 
-    done: false,
-    status: { $nin: ['completed', 'failed', 'cancelled', 'processing'] }
-  });
+    const allRuns = await Run.find({ 
+      done: false,
+      status: { $nin: ['completed', 'failed', 'cancelled', 'processing'] }
+    });
 
-  for (let run of allRuns) {
-    if (run.status === 'queued' || isRunInQueue(run.id)) continue;
+    for (let run of allRuns) {
+      if (run.status === 'queued' || isRunInQueue(run.id)) continue;
 
-    const runTime = new Date(run.time).getTime();
+      const runTime = new Date(run.time).getTime();
 
-    if (runTime <= now && run.status === 'pending') {
-      
-      if (run.label === 'VIEWS') {
-        viewsQueue.push(run);
-        run.status = 'queued';
-        await run.save();
-        addedToQueue.views++;
-        console.log(`[SCHEDULER] Added VIEWS run #${run.id} to queue (qty: ${run.quantity})`);
-      } 
-      else if (run.label === 'LIKES') {
-        likesQueue.push(run);
-        run.status = 'queued';
-        await run.save();
-        addedToQueue.likes++;
-        console.log(`[SCHEDULER] Added LIKES run #${run.id} to queue (qty: ${run.quantity})`);
-      } 
-      else if (run.label === 'SHARES') {
-        sharesQueue.push(run);
-        run.status = 'queued';
-        await run.save();
-        addedToQueue.shares++;
-        console.log(`[SCHEDULER] Added SHARES run #${run.id} to queue (qty: ${run.quantity})`);
-      } 
-      else if (run.label === 'SAVES') {
-        savesQueue.push(run);
-        run.status = 'queued';
-        await run.save();
-        addedToQueue.saves++;
-        console.log(`[SCHEDULER] Added SAVES run #${run.id} to queue (qty: ${run.quantity})`);
+      if (runTime <= now && run.status === 'pending') {
+        
+        if (run.label === 'VIEWS') {
+          viewsQueue.push(run);
+          run.status = 'queued';
+          await run.save();
+          addedToQueue.views++;
+          console.log(`[SCHEDULER] Added VIEWS run #${run.id} to queue (qty: ${run.quantity})`);
+        } 
+        else if (run.label === 'LIKES') {
+          likesQueue.push(run);
+          run.status = 'queued';
+          await run.save();
+          addedToQueue.likes++;
+          console.log(`[SCHEDULER] Added LIKES run #${run.id} to queue (qty: ${run.quantity})`);
+        } 
+        else if (run.label === 'SHARES') {
+          sharesQueue.push(run);
+          run.status = 'queued';
+          await run.save();
+          addedToQueue.shares++;
+          console.log(`[SCHEDULER] Added SHARES run #${run.id} to queue (qty: ${run.quantity})`);
+        } 
+        else if (run.label === 'SAVES') {
+          savesQueue.push(run);
+          run.status = 'queued';
+          await run.save();
+          addedToQueue.saves++;
+          console.log(`[SCHEDULER] Added SAVES run #${run.id} to queue (qty: ${run.quantity})`);
+        }
       }
     }
+
+    if (addedToQueue.views + addedToQueue.likes + addedToQueue.shares + addedToQueue.saves > 0) {
+      console.log(`[SCHEDULER] Added to queues - Views: ${addedToQueue.views}, Likes: ${addedToQueue.likes}, Shares: ${addedToQueue.shares}, Saves: ${addedToQueue.saves}`);
+    }
+
+    if (viewsQueue.length > 0 && !isExecutingViews) processViewsQueue();
+    if (likesQueue.length > 0 && !isExecutingLikes) processLikesQueue();
+    if (sharesQueue.length > 0 && !isExecutingShares) processSharesQueue();
+    if (savesQueue.length > 0 && !isExecutingSaves) processSavesQueue();
+  } catch (error) {
+    console.error('[SCHEDULER] Error:', error);
   }
-
-  if (addedToQueue.views + addedToQueue.likes + addedToQueue.shares + addedToQueue.saves > 0) {
-    console.log(`[SCHEDULER] Added to queues - Views: ${addedToQueue.views}, Likes: ${addedToQueue.likes}, Shares: ${addedToQueue.shares}, Saves: ${addedToQueue.saves}`);
-  }
-
-  if (viewsQueue.length > 0 && !isExecutingViews) processViewsQueue();
-  if (likesQueue.length > 0 && !isExecutingLikes) processLikesQueue();
-  if (sharesQueue.length > 0 && !isExecutingShares) processSharesQueue();
-  if (savesQueue.length > 0 && !isExecutingSaves) processSavesQueue();
-
 }, 10000);
 
 /* =========================
    API ENDPOINTS
 ========================= */
 app.post('/api/order', async (req, res) => {
-  const { apiUrl, apiKey, link, services, name } = req.body;
+  try {
+    const { apiUrl, apiKey, link, services, name } = req.body;
 
-  if (!apiUrl || !apiKey || !link || !services) {
-    return res.status(400).json({ error: 'Missing required fields' });
+    if (!apiUrl || !apiKey || !link || !services) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    console.log('Creating new order...');
+
+    const schedulerOrderId = `sched-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const runsForOrder = await addRuns(services, { apiUrl, apiKey, link }, schedulerOrderId);
+
+    const orderData = new Order({
+      schedulerOrderId,
+      name: name || `Order ${schedulerOrderId}`,
+      link,
+      status: 'pending',
+      totalRuns: runsForOrder.length,
+      completedRuns: 0,
+      runStatuses: runsForOrder.map(() => 'pending'),
+      createdAt: new Date(),
+      lastUpdatedAt: new Date(),
+    });
+
+    await orderData.save();
+
+    console.log(`Order created: ${schedulerOrderId} with ${runsForOrder.length} runs`);
+
+    return res.json({
+      success: true,
+      message: 'Order scheduled (persistent)',
+      schedulerOrderId,
+      status: 'pending',
+      completedRuns: 0,
+      totalRuns: runsForOrder.length,
+    });
+  } catch (error) {
+    console.error('[CREATE ORDER] Error:', error);
+    return res.status(500).json({ error: error.message });
   }
-
-  console.log('Creating new order...');
-
-  const schedulerOrderId = `sched-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-  const runsForOrder = await addRuns(services, { apiUrl, apiKey, link }, schedulerOrderId);
-
-  const orderData = new Order({
-    schedulerOrderId,
-    name: name || `Order ${schedulerOrderId}`,
-    link,
-    status: 'pending',
-    totalRuns: runsForOrder.length,
-    completedRuns: 0,
-    runStatuses: runsForOrder.map(() => 'pending'),
-    createdAt: new Date(),
-    lastUpdatedAt: new Date(),
-  });
-
-  await orderData.save();
-
-  console.log(`Order created: ${schedulerOrderId} with ${runsForOrder.length} runs`);
-
-  return res.json({
-    success: true,
-    message: 'Order scheduled (persistent)',
-    schedulerOrderId,
-    status: 'pending',
-    completedRuns: 0,
-    totalRuns: runsForOrder.length,
-  });
 });
 
 app.post('/api/services', async (req, res) => {
@@ -431,42 +436,16 @@ app.post('/api/services', async (req, res) => {
 });
 
 app.get('/api/order/status/:schedulerOrderId', async (req, res) => {
-  const { schedulerOrderId } = req.params;
-  const order = await Order.findOne({ schedulerOrderId });
-  const orderRuns = await Run.find({ schedulerOrderId });
+  try {
+    const { schedulerOrderId } = req.params;
+    const order = await Order.findOne({ schedulerOrderId });
+    const orderRuns = await Run.find({ schedulerOrderId });
 
-  if (!order) {
-    return res.status(404).json({ error: 'Order not found' });
-  }
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
 
-  return res.json({
-    schedulerOrderId: order.schedulerOrderId,
-    name: order.name,
-    link: order.link,
-    status: order.status,
-    totalRuns: order.totalRuns,
-    completedRuns: order.completedRuns,
-    runStatuses: order.runStatuses,
-    createdAt: order.createdAt,
-    lastUpdatedAt: order.lastUpdatedAt,
-    runs: orderRuns.map(r => ({
-      id: r.id,
-      label: r.label,
-      quantity: r.quantity,
-      time: r.time,
-      status: r.status,
-      smmOrderId: r.smmOrderId,
-      executedAt: r.executedAt,
-      error: r.error,
-    })),
-  });
-});
-
-app.get('/api/orders/status', async (req, res) => {
-  const allOrders = await Order.find();
-  const ordersWithRuns = await Promise.all(allOrders.map(async (order) => {
-    const orderRuns = await Run.find({ schedulerOrderId: order.schedulerOrderId });
-    return {
+    return res.json({
       schedulerOrderId: order.schedulerOrderId,
       name: order.name,
       link: order.link,
@@ -483,110 +462,152 @@ app.get('/api/orders/status', async (req, res) => {
         time: r.time,
         status: r.status,
         smmOrderId: r.smmOrderId,
+        executedAt: r.executedAt,
+        error: r.error,
       })),
-    };
-  }));
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
 
-  return res.json({ total: allOrders.length, orders: ordersWithRuns });
+app.get('/api/orders/status', async (req, res) => {
+  try {
+    const allOrders = await Order.find().sort({ createdAt: -1 });
+    const ordersWithRuns = await Promise.all(allOrders.map(async (order) => {
+      const orderRuns = await Run.find({ schedulerOrderId: order.schedulerOrderId });
+      return {
+        schedulerOrderId: order.schedulerOrderId,
+        name: order.name,
+        link: order.link,
+        status: order.status,
+        totalRuns: order.totalRuns,
+        completedRuns: order.completedRuns,
+        runStatuses: order.runStatuses,
+        createdAt: order.createdAt,
+        lastUpdatedAt: order.lastUpdatedAt,
+        runs: orderRuns.map(r => ({
+          id: r.id,
+          label: r.label,
+          quantity: r.quantity,
+          time: r.time,
+          status: r.status,
+          smmOrderId: r.smmOrderId,
+        })),
+      };
+    }));
+
+    return res.json({ total: allOrders.length, orders: ordersWithRuns });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
 });
 
 app.post('/api/order/control', async (req, res) => {
-  const { schedulerOrderId, action } = req.body;
-  if (!schedulerOrderId || !action) {
-    return res.status(400).json({ error: 'Missing schedulerOrderId or action' });
-  }
-
-  const order = await Order.findOne({ schedulerOrderId });
-  const orderRuns = await Run.find({ schedulerOrderId });
-
-  if (!order) {
-    return res.status(404).json({ error: 'Order not found' });
-  }
-
-  if (action === 'cancel') {
-    for (let run of orderRuns) {
-      if (run.status === 'pending' || run.status === 'processing' || run.status === 'queued') {
-        run.status = 'cancelled';
-        run.done = true;
-        await run.save();
-        
-        viewsQueue = viewsQueue.filter(r => r.id !== run.id);
-        likesQueue = likesQueue.filter(r => r.id !== run.id);
-        sharesQueue = sharesQueue.filter(r => r.id !== run.id);
-        savesQueue = savesQueue.filter(r => r.id !== run.id);
-      }
+  try {
+    const { schedulerOrderId, action } = req.body;
+    if (!schedulerOrderId || !action) {
+      return res.status(400).json({ error: 'Missing schedulerOrderId or action' });
     }
-    order.status = 'cancelled';
-    await order.save();
 
-    return res.json({
-      success: true,
-      status: 'cancelled',
-      completedRuns: orderRuns.filter(r => r.status === 'completed').length,
-      runStatuses: orderRuns.map(r => r.status),
-    });
-  }
+    const order = await Order.findOne({ schedulerOrderId });
+    const orderRuns = await Run.find({ schedulerOrderId });
 
-  if (action === 'pause') {
-    for (let run of orderRuns) {
-      if (run.status === 'pending' || run.status === 'queued') {
-        run.status = 'paused';
-        await run.save();
-        
-        viewsQueue = viewsQueue.filter(r => r.id !== run.id);
-        likesQueue = likesQueue.filter(r => r.id !== run.id);
-        sharesQueue = sharesQueue.filter(r => r.id !== run.id);
-        savesQueue = savesQueue.filter(r => r.id !== run.id);
-      }
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
     }
-    order.status = 'paused';
-    await order.save();
 
-    return res.json({
-      success: true,
-      status: 'paused',
-      completedRuns: orderRuns.filter(r => r.status === 'completed').length,
-      runStatuses: orderRuns.map(r => r.status),
-    });
-  }
-
-  if (action === 'resume') {
-    for (let run of orderRuns) {
-      if (run.status === 'paused') {
-        run.status = 'pending';
-        await run.save();
+    if (action === 'cancel') {
+      for (let run of orderRuns) {
+        if (run.status === 'pending' || run.status === 'processing' || run.status === 'queued') {
+          run.status = 'cancelled';
+          run.done = true;
+          await run.save();
+          
+          viewsQueue = viewsQueue.filter(r => r.id !== run.id);
+          likesQueue = likesQueue.filter(r => r.id !== run.id);
+          sharesQueue = sharesQueue.filter(r => r.id !== run.id);
+          savesQueue = savesQueue.filter(r => r.id !== run.id);
+        }
       }
+      order.status = 'cancelled';
+      await order.save();
+
+      return res.json({
+        success: true,
+        status: 'cancelled',
+        completedRuns: orderRuns.filter(r => r.status === 'completed').length,
+        runStatuses: orderRuns.map(r => r.status),
+      });
     }
-    order.status = 'running';
-    await order.save();
 
-    return res.json({
-      success: true,
-      status: 'running',
-      completedRuns: orderRuns.filter(r => r.status === 'completed').length,
-      runStatuses: orderRuns.map(r => r.status),
-    });
+    if (action === 'pause') {
+      for (let run of orderRuns) {
+        if (run.status === 'pending' || run.status === 'queued') {
+          run.status = 'paused';
+          await run.save();
+          
+          viewsQueue = viewsQueue.filter(r => r.id !== run.id);
+          likesQueue = likesQueue.filter(r => r.id !== run.id);
+          sharesQueue = sharesQueue.filter(r => r.id !== run.id);
+          savesQueue = savesQueue.filter(r => r.id !== run.id);
+        }
+      }
+      order.status = 'paused';
+      await order.save();
+
+      return res.json({
+        success: true,
+        status: 'paused',
+        completedRuns: orderRuns.filter(r => r.status === 'completed').length,
+        runStatuses: orderRuns.map(r => r.status),
+      });
+    }
+
+    if (action === 'resume') {
+      for (let run of orderRuns) {
+        if (run.status === 'paused') {
+          run.status = 'pending';
+          await run.save();
+        }
+      }
+      order.status = 'running';
+      await order.save();
+
+      return res.json({
+        success: true,
+        status: 'running',
+        completedRuns: orderRuns.filter(r => r.status === 'completed').length,
+        runStatuses: orderRuns.map(r => r.status),
+      });
+    }
+
+    return res.status(400).json({ error: 'Invalid action' });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
   }
-
-  return res.status(400).json({ error: 'Invalid action' });
 });
 
 app.get('/api/order/runs/:schedulerOrderId', async (req, res) => {
-  const { schedulerOrderId } = req.params;
-  const orderRuns = await Run.find({ schedulerOrderId });
-  return res.json({
-    schedulerOrderId,
-    runs: orderRuns.map(r => ({
-      id: r.id,
-      label: r.label,
-      quantity: r.quantity,
-      time: r.time,
-      status: r.status,
-      smmOrderId: r.smmOrderId,
-      executedAt: r.executedAt,
-      error: r.error,
-    })),
-  });
+  try {
+    const { schedulerOrderId } = req.params;
+    const orderRuns = await Run.find({ schedulerOrderId });
+    return res.json({
+      schedulerOrderId,
+      runs: orderRuns.map(r => ({
+        id: r.id,
+        label: r.label,
+        quantity: r.quantity,
+        time: r.time,
+        status: r.status,
+        smmOrderId: r.smmOrderId,
+        executedAt: r.executedAt,
+        error: r.error,
+      })),
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
 });
 
 app.get('/api/settings/min-views', (req, res) => {
@@ -629,83 +650,91 @@ app.get('/api/queues/status', (req, res) => {
 });
 
 app.post('/api/runs/retry-stuck', async (req, res) => {
-  const now = Date.now();
-  let resetCount = 0;
+  try {
+    const now = Date.now();
+    let resetCount = 0;
 
-  const allRuns = await Run.find({ done: false });
+    const allRuns = await Run.find({ done: false });
 
-  for (let run of allRuns) {
-    const runTime = new Date(run.time).getTime();
-    if (runTime <= now && run.status === 'pending') {
-      resetCount++;
+    for (let run of allRuns) {
+      const runTime = new Date(run.time).getTime();
+      if (runTime <= now && run.status === 'pending') {
+        resetCount++;
+      }
+      if (run.status === 'queued' && !isRunInQueue(run.id)) {
+        run.status = 'pending';
+        await run.save();
+        resetCount++;
+      }
     }
-    if (run.status === 'queued' && !isRunInQueue(run.id)) {
-      run.status = 'pending';
-      await run.save();
-      resetCount++;
-    }
+
+    return res.json({
+      success: true,
+      resetCount,
+      message: `Reset ${resetCount} stuck runs`
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
   }
-
-  return res.json({
-    success: true,
-    resetCount,
-    message: `Reset ${resetCount} stuck runs`
-  });
 });
 
 app.post('/api/scheduler/trigger', async (req, res) => {
-  const now = Date.now();
-  let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0 };
+  try {
+    const now = Date.now();
+    let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0 };
 
-  const allRuns = await Run.find({ 
-    done: false,
-    status: { $nin: ['completed', 'failed', 'cancelled', 'processing', 'queued'] }
-  });
+    const allRuns = await Run.find({ 
+      done: false,
+      status: { $nin: ['completed', 'failed', 'cancelled', 'processing', 'queued'] }
+    });
 
-  for (let run of allRuns) {
-    if (isRunInQueue(run.id)) continue;
-    const runTime = new Date(run.time).getTime();
+    for (let run of allRuns) {
+      if (isRunInQueue(run.id)) continue;
+      const runTime = new Date(run.time).getTime();
 
-    if (runTime <= now && run.status === 'pending') {
-      if (run.label === 'VIEWS') {
-        viewsQueue.push(run);
-        run.status = 'queued';
-        await run.save();
-        addedToQueue.views++;
-      } else if (run.label === 'LIKES') {
-        likesQueue.push(run);
-        run.status = 'queued';
-        await run.save();
-        addedToQueue.likes++;
-      } else if (run.label === 'SHARES') {
-        sharesQueue.push(run);
-        run.status = 'queued';
-        await run.save();
-        addedToQueue.shares++;
-      } else if (run.label === 'SAVES') {
-        savesQueue.push(run);
-        run.status = 'queued';
-        await run.save();
-        addedToQueue.saves++;
+      if (runTime <= now && run.status === 'pending') {
+        if (run.label === 'VIEWS') {
+          viewsQueue.push(run);
+          run.status = 'queued';
+          await run.save();
+          addedToQueue.views++;
+        } else if (run.label === 'LIKES') {
+          likesQueue.push(run);
+          run.status = 'queued';
+          await run.save();
+          addedToQueue.likes++;
+        } else if (run.label === 'SHARES') {
+          sharesQueue.push(run);
+          run.status = 'queued';
+          await run.save();
+          addedToQueue.shares++;
+        } else if (run.label === 'SAVES') {
+          savesQueue.push(run);
+          run.status = 'queued';
+          await run.save();
+          addedToQueue.saves++;
+        }
       }
     }
+
+    if (viewsQueue.length > 0 && !isExecutingViews) processViewsQueue();
+    if (likesQueue.length > 0 && !isExecutingLikes) processLikesQueue();
+    if (sharesQueue.length > 0 && !isExecutingShares) processSharesQueue();
+    if (savesQueue.length > 0 && !isExecutingSaves) processSavesQueue();
+
+    return res.json({
+      success: true,
+      addedToQueue,
+      currentQueues: {
+        views: viewsQueue.length,
+        likes: likesQueue.length,
+        shares: sharesQueue.length,
+        saves: savesQueue.length
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
   }
-
-  if (viewsQueue.length > 0 && !isExecutingViews) processViewsQueue();
-  if (likesQueue.length > 0 && !isExecutingLikes) processLikesQueue();
-  if (sharesQueue.length > 0 && !isExecutingShares) processSharesQueue();
-  if (savesQueue.length > 0 && !isExecutingSaves) processSavesQueue();
-
-  return res.json({
-    success: true,
-    addedToQueue,
-    currentQueues: {
-      views: viewsQueue.length,
-      likes: likesQueue.length,
-      shares: sharesQueue.length,
-      saves: savesQueue.length
-    }
-  });
 });
 
 /* =========================
