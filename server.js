@@ -69,7 +69,7 @@ async function placeOrder({ apiUrl, apiKey, service, link, quantity }) {
 }
 
 /* =========================
-   ADD RUNS TO STORAGE
+   ADD RUNS TO STORAGE - 🔥 FIXED
 ========================= */
 function addRuns(services, baseConfig, schedulerOrderId) {
   const runsForOrder = [];
@@ -78,9 +78,18 @@ function addRuns(services, baseConfig, schedulerOrderId) {
     if (!serviceConfig) return;
 
     const label = key.toUpperCase();
+    
+    // 🔥 FIX: Only apply MIN_VIEWS_PER_RUN to VIEWS, not to engagement
+    const isViewService = label === 'VIEWS';
 
     serviceConfig.runs.forEach((run, index) => {
-      const quantity = Math.max(run.quantity, MIN_VIEWS_PER_RUN);
+      // 🔥 Apply minimum only for views, allow 0 for others
+      const quantity = isViewService 
+        ? Math.max(run.quantity, MIN_VIEWS_PER_RUN)
+        : run.quantity;
+
+      // 🔥 Skip creating run if quantity is 0 (for likes/shares/saves)
+      if (quantity === 0) return;
 
       const runData = {
         id: Date.now() + Math.random(),
