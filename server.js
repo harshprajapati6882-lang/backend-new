@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const fs = require('fs');
+const mongoose = require('mongoose');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -9,8 +9,53 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-const DATA_FILE = 'runs.json';
-const ORDERS_FILE = 'orders.json';
+/* =========================
+   🔥 MONGODB CONNECTION
+========================= */
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://harshprajapati6882_db_user:mbyjv1uPdKtLBz1l@devanush.tqknxqf.mongodb.net/smm-panel?retryWrites=true&w=majority';
+
+mongoose.connect(MONGODB_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+})
+.then(() => console.log('✅ MongoDB Connected Successfully'))
+.catch(err => console.error('❌ MongoDB Connection Error:', err));
+
+/* =========================
+   🔥 MONGODB SCHEMAS
+========================= */
+const RunSchema = new mongoose.Schema({
+  id: { type: Number, required: true, index: true },
+  schedulerOrderId: { type: String, required: true, index: true },
+  label: { type: String, required: true },
+  apiUrl: { type: String, required: true },
+  apiKey: { type: String, required: true },
+  service: { type: String, required: true },
+  link: { type: String, required: true },
+  quantity: { type: Number, required: true },
+  time: { type: Date, required: true },
+  done: { type: Boolean, default: false },
+  status: { type: String, default: 'pending', index: true },
+  smmOrderId: { type: Number, default: null },
+  createdAt: { type: Date, default: Date.now },
+  executedAt: { type: Date, default: null },
+  error: { type: String, default: null },
+});
+
+const OrderSchema = new mongoose.Schema({
+  schedulerOrderId: { type: String, required: true, unique: true, index: true },
+  name: { type: String, required: true },
+  link: { type: String, required: true },
+  status: { type: String, default: 'pending' },
+  totalRuns: { type: Number, required: true },
+  completedRuns: { type: Number, default: 0 },
+  runStatuses: [{ type: String }],
+  createdAt: { type: Date, default: Date.now },
+  lastUpdatedAt: { type: Date, default: Date.now },
+});
+
+const Run = mongoose.model('Run', RunSchema);
+const Order = mongoose.model('Order', OrderSchema);
 
 /* =========================
    MINIMUM VIEWS PER RUN
@@ -29,38 +74,6 @@ let isExecutingViews = false;
 let isExecutingLikes = false;
 let isExecutingShares = false;
 let isExecutingSaves = false;
-
-/* =========================
-   LOAD + SAVE RUNS
-========================= */
-function loadRuns() {
-  if (!fs.existsSync(DATA_FILE)) return [];
-  try {
-    return JSON.parse(fs.readFileSync(DATA_FILE));
-  } catch (e) {
-    return [];
-  }
-}
-
-function saveRuns(runs) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(runs, null, 2));
-}
-
-function loadOrders() {
-  if (!fs.existsSync(ORDERS_FILE)) return [];
-  try {
-    return JSON.parse(fs.readFileSync(ORDERS_FILE));
-  } catch (e) {
-    return [];
-  }
-}
-
-function saveOrders(orders) {
-  fs.writeFileSync(ORDERS_FILE, JSON.stringify(orders, null, 2));
-}
-
-let allRuns = loadRuns();
-let allOrders = loadOrders();
 
 /* =========================
    PLACE ORDER
@@ -82,25 +95,25 @@ async function placeOrder({ apiUrl, apiKey, service, link, quantity }) {
 }
 
 /* =========================
-   ADD RUNS TO STORAGE
+   ADD RUNS TO DATABASE
 ========================= */
-function addRuns(services, baseConfig, schedulerOrderId) {
+async function addRuns(services, baseConfig, schedulerOrderId) {
   const runsForOrder = [];
 
-  Object.entries(services).forEach(([key, serviceConfig]) => {
-    if (!serviceConfig) return;
+  for (const [key, serviceConfig] of Object.entries(services)) {
+    if (!serviceConfig) continue;
 
     const label = key.toUpperCase();
     const isViewService = label === 'VIEWS';
 
-    serviceConfig.runs.forEach((run, index) => {
+    for (const run of serviceConfig.runs) {
       const quantity = isViewService 
         ? Math.max(run.quantity, MIN_VIEWS_PER_RUN)
         : run.quantity;
 
-      if (quantity === 0) return;
+      if (quantity === 0) continue;
 
-      const runData = {
+      const runData = new Run({
         id: Date.now() + Math.random(),
         schedulerOrderId,
         label,
@@ -113,17 +126,16 @@ function addRuns(services, baseConfig, schedulerOrderId) {
         done: false,
         status: 'pending',
         smmOrderId: null,
-        createdAt: new Date().toISOString(),
+        createdAt: new Date(),
         executedAt: null,
         error: null,
-      };
+      });
 
-      allRuns.push(runData);
+      await runData.save();
       runsForOrder.push(runData);
-    });
-  });
+    }
+  }
 
-  saveRuns(allRuns);
   return runsForOrder;
 }
 
@@ -137,8 +149,8 @@ async function executeRun(run) {
     console.log(`[${run.label}] Executing run #${run.id}, quantity: ${run.quantity}`);
 
     run.status = 'processing';
-    saveRuns(allRuns);
-    updateOrderStatus(run.schedulerOrderId);
+    await run.save();
+    await updateOrderStatus(run.schedulerOrderId);
 
     const result = await placeOrder(run);
 
@@ -147,7 +159,7 @@ async function executeRun(run) {
       run.done = true;
       run.status = 'completed';
       run.smmOrderId = result.order;
-      run.executedAt = new Date().toISOString();
+      run.executedAt = new Date();
     } else {
       console.error(`[${run.label}] FAILED`, result);
       run.status = 'failed';
@@ -160,18 +172,18 @@ async function executeRun(run) {
     run.error = err.response?.data?.error || err.message;
   }
 
-  saveRuns(allRuns);
-  updateOrderStatus(run.schedulerOrderId);
+  await run.save();
+  await updateOrderStatus(run.schedulerOrderId);
 }
 
 /* =========================
    UPDATE ORDER STATUS
 ========================= */
-function updateOrderStatus(schedulerOrderId) {
+async function updateOrderStatus(schedulerOrderId) {
   if (!schedulerOrderId) return;
 
-  const orderRuns = allRuns.filter(r => r.schedulerOrderId === schedulerOrderId);
-  const order = allOrders.find(o => o.schedulerOrderId === schedulerOrderId);
+  const orderRuns = await Run.find({ schedulerOrderId });
+  const order = await Order.findOne({ schedulerOrderId });
 
   if (!order) return;
 
@@ -193,14 +205,14 @@ function updateOrderStatus(schedulerOrderId) {
 
   order.completedRuns = completedRuns;
   order.totalRuns = totalRuns;
-  order.lastUpdatedAt = new Date().toISOString();
+  order.lastUpdatedAt = new Date();
   order.runStatuses = orderRuns.map(r => r.status);
 
-  saveOrders(allOrders);
+  await order.save();
 }
 
 /* =========================
-   🔥 QUEUE PROCESSORS - FIXED NON-BLOCKING
+   🔥 QUEUE PROCESSORS
 ========================= */
 async function processViewsQueue() {
   if (isExecutingViews || viewsQueue.length === 0) return;
@@ -217,11 +229,8 @@ async function processViewsQueue() {
   }
   
   isExecutingViews = false;
-  
-  // 🔥 Wait 2 seconds before next run
   await new Promise(resolve => setTimeout(resolve, 2000));
   
-  // 🔥 Process next run if queue not empty
   if (viewsQueue.length > 0) {
     setImmediate(() => processViewsQueue());
   }
@@ -242,7 +251,6 @@ async function processLikesQueue() {
   }
   
   isExecutingLikes = false;
-  
   await new Promise(resolve => setTimeout(resolve, 2000));
   
   if (likesQueue.length > 0) {
@@ -265,7 +273,6 @@ async function processSharesQueue() {
   }
   
   isExecutingShares = false;
-  
   await new Promise(resolve => setTimeout(resolve, 2000));
   
   if (sharesQueue.length > 0) {
@@ -288,7 +295,6 @@ async function processSavesQueue() {
   }
   
   isExecutingSaves = false;
-  
   await new Promise(resolve => setTimeout(resolve, 2000));
   
   if (savesQueue.length > 0) {
@@ -297,7 +303,7 @@ async function processSavesQueue() {
 }
 
 /* =========================
-   🔥 CHECK IF RUN ALREADY IN QUEUE
+   CHECK IF RUN IN QUEUE
 ========================= */
 function isRunInQueue(runId) {
   return viewsQueue.some(r => r.id === runId) ||
@@ -307,16 +313,18 @@ function isRunInQueue(runId) {
 }
 
 /* =========================
-   🔥 MAIN SCHEDULER - NON-BLOCKING
+   🔥 MAIN SCHEDULER
 ========================= */
 setInterval(async () => {
   const now = Date.now();
   let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0 };
 
+  const allRuns = await Run.find({ 
+    done: false,
+    status: { $nin: ['completed', 'failed', 'cancelled', 'processing'] }
+  });
+
   for (let run of allRuns) {
-    if (run.done) continue;
-    if (run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled') continue;
-    if (run.status === 'processing') continue;
     if (run.status === 'queued' || isRunInQueue(run.id)) continue;
 
     const runTime = new Date(run.time).getTime();
@@ -326,24 +334,28 @@ setInterval(async () => {
       if (run.label === 'VIEWS') {
         viewsQueue.push(run);
         run.status = 'queued';
+        await run.save();
         addedToQueue.views++;
         console.log(`[SCHEDULER] Added VIEWS run #${run.id} to queue (qty: ${run.quantity})`);
       } 
       else if (run.label === 'LIKES') {
         likesQueue.push(run);
         run.status = 'queued';
+        await run.save();
         addedToQueue.likes++;
         console.log(`[SCHEDULER] Added LIKES run #${run.id} to queue (qty: ${run.quantity})`);
       } 
       else if (run.label === 'SHARES') {
         sharesQueue.push(run);
         run.status = 'queued';
+        await run.save();
         addedToQueue.shares++;
         console.log(`[SCHEDULER] Added SHARES run #${run.id} to queue (qty: ${run.quantity})`);
       } 
       else if (run.label === 'SAVES') {
         savesQueue.push(run);
         run.status = 'queued';
+        await run.save();
         addedToQueue.saves++;
         console.log(`[SCHEDULER] Added SAVES run #${run.id} to queue (qty: ${run.quantity})`);
       }
@@ -351,28 +363,18 @@ setInterval(async () => {
   }
 
   if (addedToQueue.views + addedToQueue.likes + addedToQueue.shares + addedToQueue.saves > 0) {
-    saveRuns(allRuns);
     console.log(`[SCHEDULER] Added to queues - Views: ${addedToQueue.views}, Likes: ${addedToQueue.likes}, Shares: ${addedToQueue.shares}, Saves: ${addedToQueue.saves}`);
   }
 
-  // 🔥 Trigger queue processors (non-blocking)
-  if (viewsQueue.length > 0 && !isExecutingViews) {
-    processViewsQueue();
-  }
-  if (likesQueue.length > 0 && !isExecutingLikes) {
-    processLikesQueue();
-  }
-  if (sharesQueue.length > 0 && !isExecutingShares) {
-    processSharesQueue();
-  }
-  if (savesQueue.length > 0 && !isExecutingSaves) {
-    processSavesQueue();
-  }
+  if (viewsQueue.length > 0 && !isExecutingViews) processViewsQueue();
+  if (likesQueue.length > 0 && !isExecutingLikes) processLikesQueue();
+  if (sharesQueue.length > 0 && !isExecutingShares) processSharesQueue();
+  if (savesQueue.length > 0 && !isExecutingSaves) processSavesQueue();
 
-}, 10000); // Check every 10 seconds
+}, 10000);
 
 /* =========================
-   CREATE ORDER
+   API ENDPOINTS
 ========================= */
 app.post('/api/order', async (req, res) => {
   const { apiUrl, apiKey, link, services, name } = req.body;
@@ -384,10 +386,9 @@ app.post('/api/order', async (req, res) => {
   console.log('Creating new order...');
 
   const schedulerOrderId = `sched-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  const runsForOrder = await addRuns(services, { apiUrl, apiKey, link }, schedulerOrderId);
 
-  const runsForOrder = addRuns(services, { apiUrl, apiKey, link }, schedulerOrderId);
-
-  const orderData = {
+  const orderData = new Order({
     schedulerOrderId,
     name: name || `Order ${schedulerOrderId}`,
     link,
@@ -395,12 +396,11 @@ app.post('/api/order', async (req, res) => {
     totalRuns: runsForOrder.length,
     completedRuns: 0,
     runStatuses: runsForOrder.map(() => 'pending'),
-    createdAt: new Date().toISOString(),
-    lastUpdatedAt: new Date().toISOString(),
-  };
+    createdAt: new Date(),
+    lastUpdatedAt: new Date(),
+  });
 
-  allOrders.push(orderData);
-  saveOrders(allOrders);
+  await orderData.save();
 
   console.log(`Order created: ${schedulerOrderId} with ${runsForOrder.length} runs`);
 
@@ -414,42 +414,26 @@ app.post('/api/order', async (req, res) => {
   });
 });
 
-/* =========================
-   FETCH SERVICES
-========================= */
 app.post('/api/services', async (req, res) => {
   const { apiUrl, apiKey } = req.body;
-
   if (!apiUrl || !apiKey) {
     return res.status(400).json({ error: 'Missing API URL or key' });
   }
-
   try {
-    const params = new URLSearchParams({
-      key: apiKey,
-      action: 'services',
-    });
-
+    const params = new URLSearchParams({ key: apiKey, action: 'services' });
     const response = await axios.post(apiUrl, params.toString(), {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     });
-
     return res.json(response.data);
   } catch (error) {
-    return res.status(500).json({
-      error: error.response?.data || error.message,
-    });
+    return res.status(500).json({ error: error.response?.data || error.message });
   }
 });
 
-/* =========================
-   GET ORDER STATUS
-========================= */
-app.get('/api/order/status/:schedulerOrderId', (req, res) => {
+app.get('/api/order/status/:schedulerOrderId', async (req, res) => {
   const { schedulerOrderId } = req.params;
-
-  const order = allOrders.find(o => o.schedulerOrderId === schedulerOrderId);
-  const orderRuns = allRuns.filter(r => r.schedulerOrderId === schedulerOrderId);
+  const order = await Order.findOne({ schedulerOrderId });
+  const orderRuns = await Run.find({ schedulerOrderId });
 
   if (!order) {
     return res.status(404).json({ error: 'Order not found' });
@@ -478,14 +462,20 @@ app.get('/api/order/status/:schedulerOrderId', (req, res) => {
   });
 });
 
-/* =========================
-   GET ALL ORDERS STATUS
-========================= */
-app.get('/api/orders/status', (req, res) => {
-  const ordersWithRuns = allOrders.map(order => {
-    const orderRuns = allRuns.filter(r => r.schedulerOrderId === order.schedulerOrderId);
+app.get('/api/orders/status', async (req, res) => {
+  const allOrders = await Order.find();
+  const ordersWithRuns = await Promise.all(allOrders.map(async (order) => {
+    const orderRuns = await Run.find({ schedulerOrderId: order.schedulerOrderId });
     return {
-      ...order,
+      schedulerOrderId: order.schedulerOrderId,
+      name: order.name,
+      link: order.link,
+      status: order.status,
+      totalRuns: order.totalRuns,
+      completedRuns: order.completedRuns,
+      runStatuses: order.runStatuses,
+      createdAt: order.createdAt,
+      lastUpdatedAt: order.lastUpdatedAt,
       runs: orderRuns.map(r => ({
         id: r.id,
         label: r.label,
@@ -495,46 +485,39 @@ app.get('/api/orders/status', (req, res) => {
         smmOrderId: r.smmOrderId,
       })),
     };
-  });
+  }));
 
-  return res.json({
-    total: allOrders.length,
-    orders: ordersWithRuns,
-  });
+  return res.json({ total: allOrders.length, orders: ordersWithRuns });
 });
 
-/* =========================
-   ORDER CONTROL
-========================= */
-app.post('/api/order/control', (req, res) => {
+app.post('/api/order/control', async (req, res) => {
   const { schedulerOrderId, action } = req.body;
-
   if (!schedulerOrderId || !action) {
     return res.status(400).json({ error: 'Missing schedulerOrderId or action' });
   }
 
-  const order = allOrders.find(o => o.schedulerOrderId === schedulerOrderId);
-  const orderRuns = allRuns.filter(r => r.schedulerOrderId === schedulerOrderId);
+  const order = await Order.findOne({ schedulerOrderId });
+  const orderRuns = await Run.find({ schedulerOrderId });
 
   if (!order) {
     return res.status(404).json({ error: 'Order not found' });
   }
 
   if (action === 'cancel') {
-    orderRuns.forEach(run => {
+    for (let run of orderRuns) {
       if (run.status === 'pending' || run.status === 'processing' || run.status === 'queued') {
         run.status = 'cancelled';
         run.done = true;
+        await run.save();
         
         viewsQueue = viewsQueue.filter(r => r.id !== run.id);
         likesQueue = likesQueue.filter(r => r.id !== run.id);
         sharesQueue = sharesQueue.filter(r => r.id !== run.id);
         savesQueue = savesQueue.filter(r => r.id !== run.id);
       }
-    });
+    }
     order.status = 'cancelled';
-    saveRuns(allRuns);
-    saveOrders(allOrders);
+    await order.save();
 
     return res.json({
       success: true,
@@ -545,19 +528,19 @@ app.post('/api/order/control', (req, res) => {
   }
 
   if (action === 'pause') {
-    orderRuns.forEach(run => {
+    for (let run of orderRuns) {
       if (run.status === 'pending' || run.status === 'queued') {
         run.status = 'paused';
+        await run.save();
         
         viewsQueue = viewsQueue.filter(r => r.id !== run.id);
         likesQueue = likesQueue.filter(r => r.id !== run.id);
         sharesQueue = sharesQueue.filter(r => r.id !== run.id);
         savesQueue = savesQueue.filter(r => r.id !== run.id);
       }
-    });
+    }
     order.status = 'paused';
-    saveRuns(allRuns);
-    saveOrders(allOrders);
+    await order.save();
 
     return res.json({
       success: true,
@@ -568,14 +551,14 @@ app.post('/api/order/control', (req, res) => {
   }
 
   if (action === 'resume') {
-    orderRuns.forEach(run => {
+    for (let run of orderRuns) {
       if (run.status === 'paused') {
         run.status = 'pending';
+        await run.save();
       }
-    });
+    }
     order.status = 'running';
-    saveRuns(allRuns);
-    saveOrders(allOrders);
+    await order.save();
 
     return res.json({
       success: true,
@@ -588,14 +571,9 @@ app.post('/api/order/control', (req, res) => {
   return res.status(400).json({ error: 'Invalid action' });
 });
 
-/* =========================
-   GET ORDER RUNS
-========================= */
-app.get('/api/order/runs/:schedulerOrderId', (req, res) => {
+app.get('/api/order/runs/:schedulerOrderId', async (req, res) => {
   const { schedulerOrderId } = req.params;
-
-  const orderRuns = allRuns.filter(r => r.schedulerOrderId === schedulerOrderId);
-
+  const orderRuns = await Run.find({ schedulerOrderId });
   return res.json({
     schedulerOrderId,
     runs: orderRuns.map(r => ({
@@ -611,34 +589,20 @@ app.get('/api/order/runs/:schedulerOrderId', (req, res) => {
   });
 });
 
-/* =========================
-   GET/SET MINIMUM VIEWS
-========================= */
 app.get('/api/settings/min-views', (req, res) => {
-  return res.json({
-    minViewsPerRun: MIN_VIEWS_PER_RUN,
-  });
+  return res.json({ minViewsPerRun: MIN_VIEWS_PER_RUN });
 });
 
 app.post('/api/settings/min-views', (req, res) => {
   const { minViewsPerRun } = req.body;
-
   if (typeof minViewsPerRun !== 'number' || minViewsPerRun < 1) {
     return res.status(400).json({ error: 'Invalid minViewsPerRun value' });
   }
-
   MIN_VIEWS_PER_RUN = Math.floor(minViewsPerRun);
   console.log(`Minimum views per run updated to: ${MIN_VIEWS_PER_RUN}`);
-
-  return res.json({
-    success: true,
-    minViewsPerRun: MIN_VIEWS_PER_RUN,
-  });
+  return res.json({ success: true, minViewsPerRun: MIN_VIEWS_PER_RUN });
 });
 
-/* =========================
-   GET QUEUE STATUS
-========================= */
 app.get('/api/queues/status', (req, res) => {
   return res.json({
     views: {
@@ -664,74 +628,68 @@ app.get('/api/queues/status', (req, res) => {
   });
 });
 
-/* =========================
-   FORCE RETRY STUCK RUNS
-========================= */
-app.post('/api/runs/retry-stuck', (req, res) => {
+app.post('/api/runs/retry-stuck', async (req, res) => {
   const now = Date.now();
   let resetCount = 0;
 
-  allRuns.forEach(run => {
+  const allRuns = await Run.find({ done: false });
+
+  for (let run of allRuns) {
     const runTime = new Date(run.time).getTime();
-    
-    if (runTime <= now && run.status === 'pending' && !run.done) {
+    if (runTime <= now && run.status === 'pending') {
       resetCount++;
-      console.log(`[RETRY] Found stuck run #${run.id} (${run.label})`);
     }
-    
     if (run.status === 'queued' && !isRunInQueue(run.id)) {
       run.status = 'pending';
+      await run.save();
       resetCount++;
-      console.log(`[RETRY] Reset orphaned queued run #${run.id} (${run.label})`);
     }
-  });
-
-  saveRuns(allRuns);
+  }
 
   return res.json({
     success: true,
     resetCount,
-    message: `Reset ${resetCount} stuck runs. They will be processed on next scheduler check.`
+    message: `Reset ${resetCount} stuck runs`
   });
 });
 
-/* =========================
-   MANUAL TRIGGER SCHEDULER
-========================= */
 app.post('/api/scheduler/trigger', async (req, res) => {
   const now = Date.now();
   let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0 };
 
-  for (let run of allRuns) {
-    if (run.done) continue;
-    if (run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled') continue;
-    if (run.status === 'processing') continue;
-    if (run.status === 'queued' || isRunInQueue(run.id)) continue;
+  const allRuns = await Run.find({ 
+    done: false,
+    status: { $nin: ['completed', 'failed', 'cancelled', 'processing', 'queued'] }
+  });
 
+  for (let run of allRuns) {
+    if (isRunInQueue(run.id)) continue;
     const runTime = new Date(run.time).getTime();
 
     if (runTime <= now && run.status === 'pending') {
       if (run.label === 'VIEWS') {
         viewsQueue.push(run);
         run.status = 'queued';
+        await run.save();
         addedToQueue.views++;
       } else if (run.label === 'LIKES') {
         likesQueue.push(run);
         run.status = 'queued';
+        await run.save();
         addedToQueue.likes++;
       } else if (run.label === 'SHARES') {
         sharesQueue.push(run);
         run.status = 'queued';
+        await run.save();
         addedToQueue.shares++;
       } else if (run.label === 'SAVES') {
         savesQueue.push(run);
         run.status = 'queued';
+        await run.save();
         addedToQueue.saves++;
       }
     }
   }
-
-  saveRuns(allRuns);
 
   if (viewsQueue.length > 0 && !isExecutingViews) processViewsQueue();
   if (likesQueue.length > 0 && !isExecutingLikes) processLikesQueue();
@@ -756,7 +714,7 @@ app.post('/api/scheduler/trigger', async (req, res) => {
 setInterval(async () => {
   try {
     await axios.get("https://backend-new-6tzb.onrender.com");
-    console.log("Self-ping to keep server alive");
+    console.log("[PING] Keeping server alive");
   } catch (e) {}
 }, 5 * 60 * 1000);
 
