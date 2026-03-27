@@ -82,7 +82,7 @@ async function placeOrder({ apiUrl, apiKey, service, link, quantity }) {
 }
 
 /* =========================
-   ADD RUNS TO STORAGE - 🔥 FIXED
+   ADD RUNS TO STORAGE
 ========================= */
 function addRuns(services, baseConfig, schedulerOrderId) {
   const runsForOrder = [];
@@ -91,7 +91,6 @@ function addRuns(services, baseConfig, schedulerOrderId) {
     if (!serviceConfig) return;
 
     const label = key.toUpperCase();
-    
     const isViewService = label === 'VIEWS';
 
     serviceConfig.runs.forEach((run, index) => {
@@ -201,104 +200,99 @@ function updateOrderStatus(schedulerOrderId) {
 }
 
 /* =========================
-   🔥 QUEUE PROCESSORS - FIXED WITH CONTINUOUS LOOP
+   🔥 QUEUE PROCESSORS - FIXED NON-BLOCKING
 ========================= */
 async function processViewsQueue() {
-  // 🔥 FIX: Use while loop to continuously process queue
-  while (viewsQueue.length > 0) {
-    if (isExecutingViews) {
-      // Already executing, wait and retry
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      continue;
-    }
-    
-    isExecutingViews = true;
-    const run = viewsQueue.shift();
-    
-    console.log(`[VIEWS QUEUE] Processing run #${run.id}, Remaining in queue: ${viewsQueue.length}`);
-    
-    try {
-      await executeRun(run);
-    } catch (err) {
-      console.error(`[VIEWS QUEUE] Error:`, err);
-    }
-    
-    isExecutingViews = false;
-    
-    // 🔥 Small delay to prevent overwhelming SMM panel
-    await new Promise(resolve => setTimeout(resolve, 2000)); // 2 second gap
+  if (isExecutingViews || viewsQueue.length === 0) return;
+  
+  isExecutingViews = true;
+  const run = viewsQueue.shift();
+  
+  console.log(`[VIEWS QUEUE] Processing run #${run.id}, Remaining: ${viewsQueue.length}`);
+  
+  try {
+    await executeRun(run);
+  } catch (err) {
+    console.error(`[VIEWS QUEUE] Error:`, err);
+  }
+  
+  isExecutingViews = false;
+  
+  // 🔥 Wait 2 seconds before next run
+  await new Promise(resolve => setTimeout(resolve, 2000));
+  
+  // 🔥 Process next run if queue not empty
+  if (viewsQueue.length > 0) {
+    setImmediate(() => processViewsQueue());
   }
 }
 
 async function processLikesQueue() {
-  while (likesQueue.length > 0) {
-    if (isExecutingLikes) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      continue;
-    }
-    
-    isExecutingLikes = true;
-    const run = likesQueue.shift();
-    
-    console.log(`[LIKES QUEUE] Processing run #${run.id}, Remaining in queue: ${likesQueue.length}`);
-    
-    try {
-      await executeRun(run);
-    } catch (err) {
-      console.error(`[LIKES QUEUE] Error:`, err);
-    }
-    
-    isExecutingLikes = false;
-    
-    await new Promise(resolve => setTimeout(resolve, 2000));
+  if (isExecutingLikes || likesQueue.length === 0) return;
+  
+  isExecutingLikes = true;
+  const run = likesQueue.shift();
+  
+  console.log(`[LIKES QUEUE] Processing run #${run.id}, Remaining: ${likesQueue.length}`);
+  
+  try {
+    await executeRun(run);
+  } catch (err) {
+    console.error(`[LIKES QUEUE] Error:`, err);
+  }
+  
+  isExecutingLikes = false;
+  
+  await new Promise(resolve => setTimeout(resolve, 2000));
+  
+  if (likesQueue.length > 0) {
+    setImmediate(() => processLikesQueue());
   }
 }
 
 async function processSharesQueue() {
-  while (sharesQueue.length > 0) {
-    if (isExecutingShares) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      continue;
-    }
-    
-    isExecutingShares = true;
-    const run = sharesQueue.shift();
-    
-    console.log(`[SHARES QUEUE] Processing run #${run.id}, Remaining in queue: ${sharesQueue.length}`);
-    
-    try {
-      await executeRun(run);
-    } catch (err) {
-      console.error(`[SHARES QUEUE] Error:`, err);
-    }
-    
-    isExecutingShares = false;
-    
-    await new Promise(resolve => setTimeout(resolve, 2000));
+  if (isExecutingShares || sharesQueue.length === 0) return;
+  
+  isExecutingShares = true;
+  const run = sharesQueue.shift();
+  
+  console.log(`[SHARES QUEUE] Processing run #${run.id}, Remaining: ${sharesQueue.length}`);
+  
+  try {
+    await executeRun(run);
+  } catch (err) {
+    console.error(`[SHARES QUEUE] Error:`, err);
+  }
+  
+  isExecutingShares = false;
+  
+  await new Promise(resolve => setTimeout(resolve, 2000));
+  
+  if (sharesQueue.length > 0) {
+    setImmediate(() => processSharesQueue());
   }
 }
 
 async function processSavesQueue() {
-  while (savesQueue.length > 0) {
-    if (isExecutingSaves) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      continue;
-    }
-    
-    isExecutingSaves = true;
-    const run = savesQueue.shift();
-    
-    console.log(`[SAVES QUEUE] Processing run #${run.id}, Remaining in queue: ${savesQueue.length}`);
-    
-    try {
-      await executeRun(run);
-    } catch (err) {
-      console.error(`[SAVES QUEUE] Error:`, err);
-    }
-    
-    isExecutingSaves = false;
-    
-    await new Promise(resolve => setTimeout(resolve, 2000));
+  if (isExecutingSaves || savesQueue.length === 0) return;
+  
+  isExecutingSaves = true;
+  const run = savesQueue.shift();
+  
+  console.log(`[SAVES QUEUE] Processing run #${run.id}, Remaining: ${savesQueue.length}`);
+  
+  try {
+    await executeRun(run);
+  } catch (err) {
+    console.error(`[SAVES QUEUE] Error:`, err);
+  }
+  
+  isExecutingSaves = false;
+  
+  await new Promise(resolve => setTimeout(resolve, 2000));
+  
+  if (savesQueue.length > 0) {
+    setImmediate(() => processSavesQueue());
   }
 }
 
@@ -313,27 +307,22 @@ function isRunInQueue(runId) {
 }
 
 /* =========================
-   🔥 MAIN SCHEDULER - ADDS TO QUEUES
+   🔥 MAIN SCHEDULER - NON-BLOCKING
 ========================= */
 setInterval(async () => {
   const now = Date.now();
   let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0 };
 
   for (let run of allRuns) {
-    // Skip completed/failed/cancelled/processing runs
     if (run.done) continue;
     if (run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled') continue;
     if (run.status === 'processing') continue;
-    
-    // 🔥 Skip if already in queue
     if (run.status === 'queued' || isRunInQueue(run.id)) continue;
 
     const runTime = new Date(run.time).getTime();
 
-    // Check if run time has arrived
     if (runTime <= now && run.status === 'pending') {
       
-      // 🔥 Add to appropriate queue based on label
       if (run.label === 'VIEWS') {
         viewsQueue.push(run);
         run.status = 'queued';
@@ -361,13 +350,12 @@ setInterval(async () => {
     }
   }
 
-  // 🔥 Save if anything was added
   if (addedToQueue.views + addedToQueue.likes + addedToQueue.shares + addedToQueue.saves > 0) {
     saveRuns(allRuns);
     console.log(`[SCHEDULER] Added to queues - Views: ${addedToQueue.views}, Likes: ${addedToQueue.likes}, Shares: ${addedToQueue.shares}, Saves: ${addedToQueue.saves}`);
   }
 
-  // 🔥 Trigger queue processors (they will only run if not already running)
+  // 🔥 Trigger queue processors (non-blocking)
   if (viewsQueue.length > 0 && !isExecutingViews) {
     processViewsQueue();
   }
@@ -516,7 +504,7 @@ app.get('/api/orders/status', (req, res) => {
 });
 
 /* =========================
-   ORDER CONTROL (PAUSE/RESUME/CANCEL)
+   ORDER CONTROL
 ========================= */
 app.post('/api/order/control', (req, res) => {
   const { schedulerOrderId, action } = req.body;
@@ -538,7 +526,6 @@ app.post('/api/order/control', (req, res) => {
         run.status = 'cancelled';
         run.done = true;
         
-        // 🔥 Remove from queues if present
         viewsQueue = viewsQueue.filter(r => r.id !== run.id);
         likesQueue = likesQueue.filter(r => r.id !== run.id);
         sharesQueue = sharesQueue.filter(r => r.id !== run.id);
@@ -562,7 +549,6 @@ app.post('/api/order/control', (req, res) => {
       if (run.status === 'pending' || run.status === 'queued') {
         run.status = 'paused';
         
-        // 🔥 Remove from queues if present
         viewsQueue = viewsQueue.filter(r => r.id !== run.id);
         likesQueue = likesQueue.filter(r => r.id !== run.id);
         sharesQueue = sharesQueue.filter(r => r.id !== run.id);
@@ -651,7 +637,7 @@ app.post('/api/settings/min-views', (req, res) => {
 });
 
 /* =========================
-   🔥 GET QUEUE STATUS (DEBUG ENDPOINT)
+   GET QUEUE STATUS
 ========================= */
 app.get('/api/queues/status', (req, res) => {
   return res.json({
@@ -679,7 +665,7 @@ app.get('/api/queues/status', (req, res) => {
 });
 
 /* =========================
-   🔥 FORCE RETRY STUCK RUNS (NEW ENDPOINT)
+   FORCE RETRY STUCK RUNS
 ========================= */
 app.post('/api/runs/retry-stuck', (req, res) => {
   const now = Date.now();
@@ -688,14 +674,11 @@ app.post('/api/runs/retry-stuck', (req, res) => {
   allRuns.forEach(run => {
     const runTime = new Date(run.time).getTime();
     
-    // If run time has passed and status is still pending, reset it
     if (runTime <= now && run.status === 'pending' && !run.done) {
-      // It will be picked up by scheduler on next interval
       resetCount++;
       console.log(`[RETRY] Found stuck run #${run.id} (${run.label})`);
     }
     
-    // If status is queued but not in any queue, reset to pending
     if (run.status === 'queued' && !isRunInQueue(run.id)) {
       run.status = 'pending';
       resetCount++;
@@ -713,7 +696,7 @@ app.post('/api/runs/retry-stuck', (req, res) => {
 });
 
 /* =========================
-   🔥 MANUAL TRIGGER SCHEDULER (DEBUG ENDPOINT)
+   MANUAL TRIGGER SCHEDULER
 ========================= */
 app.post('/api/scheduler/trigger', async (req, res) => {
   const now = Date.now();
@@ -750,7 +733,6 @@ app.post('/api/scheduler/trigger', async (req, res) => {
 
   saveRuns(allRuns);
 
-  // Trigger processors
   if (viewsQueue.length > 0 && !isExecutingViews) processViewsQueue();
   if (likesQueue.length > 0 && !isExecutingLikes) processLikesQueue();
   if (sharesQueue.length > 0 && !isExecutingShares) processSharesQueue();
