@@ -141,35 +141,70 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
 ========================= */
 async function executeRun(run) {
   try {
+    if (!run || !run._id) {
+      console.warn(`[${run?.label}] Invalid run, skipping`);
+      return;
+    }
+
     if (!run.quantity || run.quantity <= 0) return;
 
     console.log(`[${run.label}] Executing run #${run.id}, quantity: ${run.quantity}`);
 
-    run.status = 'processing';
-    await run.save();
+    // 🔥 SAFE UPDATE (no version conflict)
+    await Run.updateOne(
+      { _id: run._id },
+      { $set: { status: 'processing' } }
+    );
+
     await updateOrderStatus(run.schedulerOrderId);
 
     const result = await placeOrder(run);
 
     if (result?.order) {
       console.log(`[${run.label}] SUCCESS - SMM Order ID: ${result.order}`);
-      run.done = true;
-      run.status = 'completed';
-      run.smmOrderId = result.order;
-      run.executedAt = new Date();
+
+      await Run.updateOne(
+        { _id: run._id },
+        {
+          $set: {
+            done: true,
+            status: 'completed',
+            smmOrderId: result.order,
+            executedAt: new Date(),
+          }
+        }
+      );
+
     } else {
       console.error(`[${run.label}] FAILED`, result);
-      run.status = 'failed';
-      run.error = result?.error || 'Unknown error';
+
+      await Run.updateOne(
+        { _id: run._id },
+        {
+          $set: {
+            status: 'failed',
+            error: result?.error || 'Unknown error'
+          }
+        }
+      );
     }
 
   } catch (err) {
     console.error(`[${run.label}] ERROR`, err.response?.data || err.message);
-    run.status = 'failed';
-    run.error = err.response?.data?.error || err.message;
+
+    if (run?._id) {
+      await Run.updateOne(
+        { _id: run._id },
+        {
+          $set: {
+            status: 'failed',
+            error: err.response?.data?.error || err.message
+          }
+        }
+      );
+    }
   }
 
-  await run.save();
   await updateOrderStatus(run.schedulerOrderId);
 }
 
