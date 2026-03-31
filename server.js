@@ -141,6 +141,24 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
 ========================= */
 async function executeRun(run) {
   try {
+     // 🔒 prevent same-type duplicate orders (IMPORTANT)
+const activeSameType = await Run.findOne({
+  link: run.link,
+  label: run.label,
+  status: { $in: ['processing'] }
+});
+
+if (activeSameType && activeSameType._id.toString() !== run._id.toString()) {
+  console.log(`[${run.label}] Skipping - same type already active for this link`);
+
+  // push back to queue
+  if (run.label === 'VIEWS') viewsQueue.push(run);
+  if (run.label === 'LIKES') likesQueue.push(run);
+  if (run.label === 'SHARES') sharesQueue.push(run);
+  if (run.label === 'SAVES') savesQueue.push(run);
+
+  return;
+}
     if (!run || !run._id) {
       console.warn(`[${run?.label}] Invalid run, skipping`);
       return;
@@ -240,7 +258,18 @@ async function updateOrderStatus(schedulerOrderId) {
   order.lastUpdatedAt = new Date();
   order.runStatuses = orderRuns.map(r => r.status);
 
-  await order.save();
+  await Order.updateOne(
+  { schedulerOrderId },
+  {
+    $set: {
+      status: order.status,
+      completedRuns: order.completedRuns,
+      totalRuns: order.totalRuns,
+      lastUpdatedAt: new Date(),
+      runStatuses: order.runStatuses
+    }
+  }
+);
 }
 
 /* =========================
@@ -261,7 +290,7 @@ async function processViewsQueue() {
   }
   
   isExecutingViews = false;
-  await new Promise(resolve => setTimeout(resolve, 2000));
+  await new Promise(resolve => setTimeout(resolve, 8000));
   
   if (viewsQueue.length > 0) {
     setImmediate(() => processViewsQueue());
@@ -283,7 +312,7 @@ async function processLikesQueue() {
   }
   
   isExecutingLikes = false;
-  await new Promise(resolve => setTimeout(resolve, 2000));
+  await new Promise(resolve => setTimeout(resolve, 8000));
   
   if (likesQueue.length > 0) {
     setImmediate(() => processLikesQueue());
@@ -305,7 +334,7 @@ async function processSharesQueue() {
   }
   
   isExecutingShares = false;
-  await new Promise(resolve => setTimeout(resolve, 2000));
+  await new Promise(resolve => setTimeout(resolve, 8000));
   
   if (sharesQueue.length > 0) {
     setImmediate(() => processSharesQueue());
@@ -327,7 +356,7 @@ async function processSavesQueue() {
   }
   
   isExecutingSaves = false;
-  await new Promise(resolve => setTimeout(resolve, 2000));
+  await new Promise(resolve => setTimeout(resolve, 8000));
   
   if (savesQueue.length > 0) {
     setImmediate(() => processSavesQueue());
