@@ -476,6 +476,7 @@ setInterval(async () => {
 app.post('/api/order', async (req, res) => {
   try {
     const { apiUrl, apiKey, link, services, name } = req.body;
+    console.log("SERVICES RECEIVED:", JSON.stringify(services, null, 2));
 
     if (!apiUrl || !apiKey || !link || !services) {
       return res.status(400).json({ error: 'Missing required fields' });
