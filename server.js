@@ -158,6 +158,7 @@ if (activeSameType && activeSameType._id.toString() !== run._id.toString()) {
   if (run.label === 'LIKES') likesQueue.push(run);
   if (run.label === 'SHARES') sharesQueue.push(run);
   if (run.label === 'SAVES') savesQueue.push(run);
+  if (run.label === 'COMMENTS') commentsQueue.push(run);
 
   return;
 }
@@ -395,7 +396,7 @@ function isRunInQueue(runId) {
          likesQueue.some(r => r.id === runId) ||
          sharesQueue.some(r => r.id === runId) ||
          savesQueue.some(r => r.id === runId); ||
-         commentsQueue.some(r => r.id === runId)
+         commentsQueue.some(r => r.id === runId);
 }
 
 /* =========================
@@ -404,7 +405,7 @@ function isRunInQueue(runId) {
 setInterval(async () => {
   try {
     const now = Date.now();
-    let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0 };
+    let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0 };
 
     const allRuns = await Run.find({ 
       done: false,
@@ -457,13 +458,14 @@ setInterval(async () => {
     }
 
     if (addedToQueue.views + addedToQueue.likes + addedToQueue.shares + addedToQueue.saves > 0) {
-      console.log(`[SCHEDULER] Added to queues - Views: ${addedToQueue.views}, Likes: ${addedToQueue.likes}, Shares: ${addedToQueue.shares}, Saves: ${addedToQueue.saves}`);
+      console.log(`[SCHEDULER] Added to queues - Views: ${addedToQueue.views}, Likes: ${addedToQueue.likes}, Shares: ${addedToQueue.shares}, Saves: ${addedToQueue.saves}, Comments: ${addedToQueue.comments}`);
     }
 
     if (viewsQueue.length > 0 && !isExecutingViews) processViewsQueue();
     if (likesQueue.length > 0 && !isExecutingLikes) processLikesQueue();
     if (sharesQueue.length > 0 && !isExecutingShares) processSharesQueue();
     if (savesQueue.length > 0 && !isExecutingSaves) processSavesQueue();
+    if (commentsQueue.length > 0 && !isExecutingComments) processCommentsQueue();
   } catch (error) {
     console.error('[SCHEDULER] Error:', error);
   }
@@ -743,6 +745,11 @@ app.get('/api/queues/status', (req, res) => {
       isExecuting: isExecutingSaves,
       pending: savesQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
     }
+     comments: {
+  queueLength: commentsQueue.length,
+  isExecuting: isExecutingComments,
+  pending: commentsQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
+}
   });
 });
 
