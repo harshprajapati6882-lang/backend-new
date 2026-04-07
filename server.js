@@ -742,7 +742,7 @@ app.get('/api/queues/status', (req, res) => {
     saves: {
   queueLength: savesQueue.length,
   isExecuting: isExecutingSaves,
-  pending: savesQueue.map(...)
+  pending: savesQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
 },
 comments: {
   queueLength: commentsQueue.length,
