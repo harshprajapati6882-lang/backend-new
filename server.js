@@ -395,7 +395,7 @@ function isRunInQueue(runId) {
   return viewsQueue.some(r => r.id === runId) ||
          likesQueue.some(r => r.id === runId) ||
          sharesQueue.some(r => r.id === runId) ||
-         savesQueue.some(r => r.id === runId); ||
+         savesQueue.some(r => r.id === runId) ||
          commentsQueue.some(r => r.id === runId);
 }
 
@@ -448,12 +448,11 @@ setInterval(async () => {
           console.log(`[SCHEDULER] Added SAVES run #${run.id} to queue (qty: ${run.quantity})`);
         }
         else if (run.label === 'COMMENTS') {
-           commentsQueue.push(run);
-           run.status = 'queued';
-           await run.save();
-           addedToQueue.comments++;
-           console.log(`[SCHEDULER] Added COMMENTS run #${run.id} to queue (qty: ${run.quantity})`);
-        } 
+  commentsQueue.push(run);
+  run.status = 'queued';
+  await run.save();
+  addedToQueue.comments++;
+}
       }
     }
 
@@ -741,14 +740,18 @@ app.get('/api/queues/status', (req, res) => {
       pending: sharesQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
     },
     saves: {
-      queueLength: savesQueue.length,
-      isExecuting: isExecutingSaves,
-      pending: savesQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
-    }
-     comments: {
+  queueLength: savesQueue.length,
+  isExecuting: isExecutingSaves,
+  pending: savesQueue.map(...)
+},
+comments: {
   queueLength: commentsQueue.length,
   isExecuting: isExecutingComments,
-  pending: commentsQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
+  pending: commentsQueue.map(r => ({
+    id: r.id,
+    quantity: r.quantity,
+    time: r.time
+  }))
 }
   });
 });
