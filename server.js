@@ -66,11 +66,13 @@ let viewsQueue = [];
 let likesQueue = [];
 let sharesQueue = [];
 let savesQueue = [];
+let commentsQueue = [];
 
 let isExecutingViews = false;
 let isExecutingLikes = false;
 let isExecutingShares = false;
 let isExecutingSaves = false;
+let isExecutingComments = false;
 
 /* =========================
    PLACE ORDER
@@ -363,6 +365,28 @@ async function processSavesQueue() {
   }
 }
 
+async function processCommentsQueue() {
+  if (isExecutingComments || commentsQueue.length === 0) return;
+  
+  isExecutingComments = true;
+  const run = commentsQueue.shift();
+  
+  console.log(`[COMMENTS QUEUE] Processing run #${run.id}, Remaining: ${commentsQueue.length}`);
+  
+  try {
+    await executeRun(run);
+  } catch (err) {
+    console.error(`[COMMENTS QUEUE] Error:`, err);
+  }
+  
+  isExecutingComments = false;
+  await new Promise(resolve => setTimeout(resolve, 8000));
+  
+  if (commentsQueue.length > 0) {
+    setImmediate(() => processCommentsQueue());
+  }
+}
+
 /* =========================
    CHECK IF RUN IN QUEUE
 ========================= */
@@ -370,7 +394,8 @@ function isRunInQueue(runId) {
   return viewsQueue.some(r => r.id === runId) ||
          likesQueue.some(r => r.id === runId) ||
          sharesQueue.some(r => r.id === runId) ||
-         savesQueue.some(r => r.id === runId);
+         savesQueue.some(r => r.id === runId); ||
+         commentsQueue.some(r => r.id === runId)
 }
 
 /* =========================
@@ -421,6 +446,13 @@ setInterval(async () => {
           addedToQueue.saves++;
           console.log(`[SCHEDULER] Added SAVES run #${run.id} to queue (qty: ${run.quantity})`);
         }
+        else if (run.label === 'COMMENTS') {
+           commentsQueue.push(run);
+           run.status = 'queued';
+           await run.save();
+           addedToQueue.comments++;
+           console.log(`[SCHEDULER] Added COMMENTS run #${run.id} to queue (qty: ${run.quantity})`);
+        } 
       }
     }
 
@@ -592,6 +624,7 @@ app.post('/api/order/control', async (req, res) => {
           likesQueue = likesQueue.filter(r => r.id !== run.id);
           sharesQueue = sharesQueue.filter(r => r.id !== run.id);
           savesQueue = savesQueue.filter(r => r.id !== run.id);
+          commentsQueue = commentsQueue.filter(r => r.id !== run.id);
         }
       }
       order.status = 'cancelled';
@@ -745,7 +778,7 @@ app.post('/api/runs/retry-stuck', async (req, res) => {
 app.post('/api/scheduler/trigger', async (req, res) => {
   try {
     const now = Date.now();
-    let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0 };
+    let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0 };
 
     const allRuns = await Run.find({ 
       done: false,
@@ -785,6 +818,7 @@ app.post('/api/scheduler/trigger', async (req, res) => {
     if (likesQueue.length > 0 && !isExecutingLikes) processLikesQueue();
     if (sharesQueue.length > 0 && !isExecutingShares) processSharesQueue();
     if (savesQueue.length > 0 && !isExecutingSaves) processSavesQueue();
+    if (commentsQueue.length > 0 && !isExecutingComments) processCommentsQueue();
 
     return res.json({
       success: true,
