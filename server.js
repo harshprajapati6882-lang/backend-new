@@ -116,11 +116,30 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
     for (const run of serviceConfig.runs) {
       let quantity;
 
-let quantity;
-
-// 🔥 VIEWS FIX
+// 🔥 VIEWS
 if (label === 'VIEWS') {
-  if (!run.quantity || run.quantity < 100) continue; // ❌ skip small runs
+  if (!run.quantity || run.quantity < 100) continue;
+  quantity = run.quantity;
+}
+
+// 🔥 COMMENTS
+else if (label === 'COMMENTS') {
+  if (!run.comments) continue;
+
+  const commentCount = run.comments
+    .split('\n')
+    .filter(c => c.trim().length > 0).length;
+
+  if (commentCount < 5) continue;
+
+  quantity = commentCount;
+}
+
+// 🔥 OTHER (likes, shares, saves)
+else {
+  if (!run.quantity || run.quantity <= 0) continue;
+  quantity = run.quantity;
+}
   quantity = run.quantity;
 }
 
@@ -226,6 +245,8 @@ if (activeSameType && activeSameType._id.toString() !== run._id.toString()) {
 
 if (run.label === 'COMMENTS') {
   payload.comments = run.comments;
+  payload.quantity = run.quantity;
+} else {
   payload.quantity = run.quantity;
 }
 
