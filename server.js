@@ -130,13 +130,22 @@ if (label === 'VIEWS') {
 else if (label === 'COMMENTS') {
   if (!run.comments) continue;
 
-  const commentCount = run.comments
+  let lines = run.comments
     .split('\n')
-    .filter(c => c.trim().length > 0).length;
+    .map(c => c.trim())
+    .filter(c => c.length > 0);
 
-  if (commentCount < 5) continue;
+  if (lines.length < 5) continue;
 
-  quantity = commentCount;
+  // 🔥 LIMIT MAX TO 10
+  if (lines.length > 10) {
+  lines = lines.sort(() => Math.random() - 0.5).slice(0, 10);
+}
+
+  // 🔥 UPDATE COMMENTS AFTER TRIM
+  run.comments = lines.join('\n');
+
+  quantity = lines.length;
 }
 
 // OTHERS (likes, shares, saves)
