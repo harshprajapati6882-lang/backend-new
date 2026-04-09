@@ -347,24 +347,28 @@ async function updateOrderStatus(schedulerOrderId) {
 ========================= */
 async function processViewsQueue() {
   if (isExecutingViews || viewsQueue.length === 0) return;
-  
+
   isExecutingViews = true;
   const run = viewsQueue.shift();
 
-// 🔥 CHECK BEFORE EXECUTE
-const freshRun = await Run.findById(run._id);
+  console.log(`[VIEWS QUEUE] Processing run #${run.id}, Remaining: ${viewsQueue.length}`);
 
-if (!freshRun || freshRun.status === 'cancelled') {
-  console.log(`[VIEWS QUEUE] Skipped cancelled run`);
-} else {
-  await executeRun(freshRun);
-} catch (err) {
+  try {
+    const freshRun = await Run.findById(run._id);
+
+    if (!freshRun || freshRun.status === 'cancelled') {
+      console.log(`[VIEWS QUEUE] Skipped cancelled run`);
+    } else {
+      await executeRun(freshRun);
+    }
+
+  } catch (err) {
     console.error(`[VIEWS QUEUE] Error:`, err);
   }
-  
+
   isExecutingViews = false;
   await new Promise(resolve => setTimeout(resolve, 8000));
-  
+
   if (viewsQueue.length > 0) {
     setImmediate(() => processViewsQueue());
   }
@@ -372,21 +376,28 @@ if (!freshRun || freshRun.status === 'cancelled') {
 
 async function processLikesQueue() {
   if (isExecutingLikes || likesQueue.length === 0) return;
-  
+
   isExecutingLikes = true;
   const run = likesQueue.shift();
-  
+
   console.log(`[LIKES QUEUE] Processing run #${run.id}, Remaining: ${likesQueue.length}`);
-  
+
   try {
-    await executeRun(run);
+    const freshRun = await Run.findById(run._id);
+
+    if (!freshRun || freshRun.status === 'cancelled') {
+      console.log(`[LIKES QUEUE] Skipped cancelled run`);
+    } else {
+      await executeRun(freshRun);
+    }
+
   } catch (err) {
     console.error(`[LIKES QUEUE] Error:`, err);
   }
-  
+
   isExecutingLikes = false;
   await new Promise(resolve => setTimeout(resolve, 8000));
-  
+
   if (likesQueue.length > 0) {
     setImmediate(() => processLikesQueue());
   }
@@ -394,21 +405,28 @@ async function processLikesQueue() {
 
 async function processSharesQueue() {
   if (isExecutingShares || sharesQueue.length === 0) return;
-  
+
   isExecutingShares = true;
   const run = sharesQueue.shift();
-  
+
   console.log(`[SHARES QUEUE] Processing run #${run.id}, Remaining: ${sharesQueue.length}`);
-  
+
   try {
-    await executeRun(run);
+    const freshRun = await Run.findById(run._id);
+
+    if (!freshRun || freshRun.status === 'cancelled') {
+      console.log(`[SHARES QUEUE] Skipped cancelled run`);
+    } else {
+      await executeRun(freshRun);
+    }
+
   } catch (err) {
     console.error(`[SHARES QUEUE] Error:`, err);
   }
-  
+
   isExecutingShares = false;
   await new Promise(resolve => setTimeout(resolve, 8000));
-  
+
   if (sharesQueue.length > 0) {
     setImmediate(() => processSharesQueue());
   }
@@ -416,21 +434,28 @@ async function processSharesQueue() {
 
 async function processSavesQueue() {
   if (isExecutingSaves || savesQueue.length === 0) return;
-  
+
   isExecutingSaves = true;
   const run = savesQueue.shift();
-  
+
   console.log(`[SAVES QUEUE] Processing run #${run.id}, Remaining: ${savesQueue.length}`);
-  
+
   try {
-    await executeRun(run);
+    const freshRun = await Run.findById(run._id);
+
+    if (!freshRun || freshRun.status === 'cancelled') {
+      console.log(`[SAVES QUEUE] Skipped cancelled run`);
+    } else {
+      await executeRun(freshRun);
+    }
+
   } catch (err) {
     console.error(`[SAVES QUEUE] Error:`, err);
   }
-  
+
   isExecutingSaves = false;
   await new Promise(resolve => setTimeout(resolve, 8000));
-  
+
   if (savesQueue.length > 0) {
     setImmediate(() => processSavesQueue());
   }
@@ -438,26 +463,32 @@ async function processSavesQueue() {
 
 async function processCommentsQueue() {
   if (isExecutingComments || commentsQueue.length === 0) return;
-  
+
   isExecutingComments = true;
   const run = commentsQueue.shift();
-  
+
   console.log(`[COMMENTS QUEUE] Processing run #${run.id}, Remaining: ${commentsQueue.length}`);
-  
+
   try {
-    await executeRun(run);
+    const freshRun = await Run.findById(run._id);
+
+    if (!freshRun || freshRun.status === 'cancelled') {
+      console.log(`[COMMENTS QUEUE] Skipped cancelled run`);
+    } else {
+      await executeRun(freshRun);
+    }
+
   } catch (err) {
     console.error(`[COMMENTS QUEUE] Error:`, err);
   }
-  
+
   isExecutingComments = false;
   await new Promise(resolve => setTimeout(resolve, 8000));
-  
+
   if (commentsQueue.length > 0) {
     setImmediate(() => processCommentsQueue());
   }
 }
-
 /* =========================
    CHECK IF RUN IN QUEUE
 ========================= */
