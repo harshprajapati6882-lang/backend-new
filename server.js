@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const mongoose = require('mongoose');
+mongoose.set('bufferCommands', false);
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -14,9 +15,17 @@ app.use(express.json());
 ========================= */
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://harshprajapati6882_db_user:mbyjv1uPdKtLBz1l@devanush.tqknxqf.mongodb.net/smm-panel?retryWrites=true&w=majority';
 
-mongoose.connect(MONGODB_URI)
-  .then(() => console.log('✅ MongoDB Connected Successfully'))
-  .catch(err => console.error('❌ MongoDB Connection Error:', err));
+mongoose.connect(MONGODB_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+  serverSelectionTimeoutMS: 30000, // 🔥 increase timeout
+})
+.then(() => {
+  console.log('✅ MongoDB Connected Successfully');
+})
+.catch(err => {
+  console.error('❌ MongoDB Connection Error:', err);
+});
 
 /* =========================
    🔥 MONGODB SCHEMAS
@@ -425,7 +434,10 @@ function isRunInQueue(runId) {
 /* =========================
    🔥 MAIN SCHEDULER
 ========================= */
-setInterval(async () => {
+mongoose.connection.once('open', () => {
+  console.log("🚀 Scheduler started after DB connected");
+
+  setInterval(async () => {
   try {
     const now = Date.now();
     let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0 };
@@ -491,7 +503,8 @@ setInterval(async () => {
   } catch (error) {
     console.error('[SCHEDULER] Error:', error);
   }
-}, 10000);
+  }, 10000);
+});
 
 /* =========================
    API ENDPOINTS
