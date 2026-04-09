@@ -184,6 +184,13 @@ else {
    EXECUTE RUN
 ========================= */
 async function executeRun(run) {
+   // 🔥 STOP IF ORDER CANCELLED
+const order = await Order.findOne({ schedulerOrderId: run.schedulerOrderId });
+
+if (!order || order.status === 'cancelled') {
+  console.log(`[SKIP] Order cancelled → run skipped`);
+  return;
+}
   try {
      // 🔒 prevent same-type duplicate orders (IMPORTANT)
 const activeSameType = await Run.findOne({
@@ -473,6 +480,11 @@ mongoose.connection.once('open', () => {
 
     for (let run of allRuns) {
       if (run.status === 'queued' || isRunInQueue(run.id)) continue;
+      const order = await Order.findOne({ schedulerOrderId: run.schedulerOrderId });
+
+if (!order || order.status === 'cancelled') {
+  continue; // 🔥 DO NOT ADD TO QUEUE
+}
 
       const runTime = new Date(run.time).getTime();
 
