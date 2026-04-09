@@ -116,13 +116,13 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
     for (const run of serviceConfig.runs) {
       let quantity;
 
-// 🔥 VIEWS
+// VIEWS
 if (label === 'VIEWS') {
   if (!run.quantity || run.quantity < 100) continue;
   quantity = run.quantity;
 }
 
-// 🔥 COMMENTS
+// COMMENTS
 else if (label === 'COMMENTS') {
   if (!run.comments) continue;
 
@@ -135,11 +135,9 @@ else if (label === 'COMMENTS') {
   quantity = commentCount;
 }
 
-// 🔥 OTHER (likes, shares, saves)
+// OTHERS
 else {
   if (!run.quantity || run.quantity <= 0) continue;
-  quantity = run.quantity;
-}
   quantity = run.quantity;
 }
 
