@@ -186,6 +186,10 @@ else {
 async function executeRun(run) {
    // 🔥 STOP IF ORDER CANCELLED
 const order = await Order.findOne({ schedulerOrderId: run.schedulerOrderId });
+   if (run.status === 'cancelled') {
+  console.log(`[SKIP] Run already cancelled`);
+  return;
+}
 
 if (!order || order.status === 'cancelled') {
   console.log(`[SKIP] Order cancelled → run skipped`);
@@ -346,12 +350,15 @@ async function processViewsQueue() {
   
   isExecutingViews = true;
   const run = viewsQueue.shift();
-  
-  console.log(`[VIEWS QUEUE] Processing run #${run.id}, Remaining: ${viewsQueue.length}`);
-  
-  try {
-    await executeRun(run);
-  } catch (err) {
+
+// 🔥 CHECK BEFORE EXECUTE
+const freshRun = await Run.findById(run._id);
+
+if (!freshRun || freshRun.status === 'cancelled') {
+  console.log(`[VIEWS QUEUE] Skipped cancelled run`);
+} else {
+  await executeRun(freshRun);
+} catch (err) {
     console.error(`[VIEWS QUEUE] Error:`, err);
   }
   
