@@ -85,7 +85,7 @@ let isExecutingComments = false;
 /* =========================
    PLACE ORDER
 ========================= */
-async function placeOrder({ apiUrl, apiKey, service, link, quantity }) {
+async function placeOrder({ apiUrl, apiKey, service, link, quantity, comments }) {
   const params = new URLSearchParams({
     key: apiKey,
     action: 'add',
@@ -94,13 +94,17 @@ async function placeOrder({ apiUrl, apiKey, service, link, quantity }) {
     quantity: String(quantity),
   });
 
+  // 🔥 ADD THIS
+  if (comments) {
+    params.append('comments', comments);
+  }
+
   const response = await axios.post(apiUrl, params.toString(), {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
   });
 
   return response.data;
 }
-
 /* =========================
    ADD RUNS TO DATABASE
 ========================= */
