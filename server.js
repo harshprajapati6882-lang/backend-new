@@ -821,7 +821,12 @@ app.post('/api/scheduler/trigger', async (req, res) => {
           run.status = 'queued';
           await run.save();
           addedToQueue.saves++;
-        }
+        } else if (run.label === 'COMMENTS') {
+  commentsQueue.push(run);
+  run.status = 'queued';
+  await run.save();
+  addedToQueue.comments++;
+}
       }
     }
 
