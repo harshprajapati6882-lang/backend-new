@@ -117,9 +117,13 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
       let quantity;
 
 if (label === 'COMMENTS') {
-  // 🔥 custom comments case
   if (!run.comments) continue;
-  quantity = 1; // fake quantity just for DB
+
+  const commentCount = run.comments
+    .split('\n')
+    .filter(c => c.trim().length > 0).length;
+
+  quantity = commentCount; // ✅ REAL quantity
 } else {
   quantity = isViewService
     ? Math.max(run.quantity, MIN_VIEWS_PER_RUN)
@@ -205,7 +209,6 @@ if (activeSameType && activeSameType._id.toString() !== run._id.toString()) {
 
 if (run.label === 'COMMENTS') {
   payload.comments = run.comments;
-} else {
   payload.quantity = run.quantity;
 }
 
