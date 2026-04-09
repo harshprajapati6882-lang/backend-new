@@ -135,37 +135,11 @@ else if (label === 'COMMENTS') {
   quantity = commentCount;
 }
 
-// OTHERS
+// OTHERS (likes, shares, saves)
 else {
   if (!run.quantity || run.quantity <= 0) continue;
   quantity = run.quantity;
 }
-
-// 🔥 COMMENTS FIX
-else if (label === 'COMMENTS') {
-  if (!run.comments) continue;
-
-  const commentCount = run.comments
-    .split('\n')
-    .filter(c => c.trim().length > 0).length;
-
-  if (commentCount < 5) continue; // ❌ skip small runs
-
-  quantity = commentCount;
-}
-
-// 🔥 OTHER SERVICES
-else {
-  if (!run.quantity || run.quantity <= 0) continue;
-  quantity = run.quantity;
-} else {
-  quantity = isViewService
-    ? Math.max(run.quantity, MIN_VIEWS_PER_RUN)
-    : run.quantity;
-
-  if (!quantity || quantity <= 0) continue;
-}
-
       const runData = new Run({
         id: Date.now() + Math.random(),
         schedulerOrderId,
