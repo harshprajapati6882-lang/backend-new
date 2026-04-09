@@ -37,6 +37,7 @@ const RunSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
   executedAt: { type: Date, default: null },
   error: { type: String, default: null },
+  comments: { type: String, default: null },
 });
 
 const OrderSchema = new mongoose.Schema({
@@ -106,11 +107,19 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
     const isViewService = label === 'VIEWS';
 
     for (const run of serviceConfig.runs) {
-      const quantity = isViewService 
-        ? Math.max(run.quantity, MIN_VIEWS_PER_RUN)
-        : run.quantity;
+      let quantity;
 
-      if (quantity === 0) continue;
+if (label === 'COMMENTS') {
+  // 🔥 custom comments case
+  if (!run.comments) continue;
+  quantity = 1; // fake quantity just for DB
+} else {
+  quantity = isViewService
+    ? Math.max(run.quantity, MIN_VIEWS_PER_RUN)
+    : run.quantity;
+
+  if (!quantity || quantity <= 0) continue;
+}
 
       const runData = new Run({
         id: Date.now() + Math.random(),
@@ -128,6 +137,7 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
         createdAt: new Date(),
         executedAt: null,
         error: null,
+        comments: run.comments || null,
       });
 
       await runData.save();
@@ -179,7 +189,20 @@ if (activeSameType && activeSameType._id.toString() !== run._id.toString()) {
 
     await updateOrderStatus(run.schedulerOrderId);
 
-    const result = await placeOrder(run);
+    let payload = {
+  apiUrl: run.apiUrl,
+  apiKey: run.apiKey,
+  service: run.service,
+  link: run.link,
+};
+
+if (run.label === 'COMMENTS') {
+  payload.comments = run.comments;
+} else {
+  payload.quantity = run.quantity;
+}
+
+const result = await placeOrder(payload);
 
     if (result?.order) {
       console.log(`[${run.label}] SUCCESS - SMM Order ID: ${result.order}`);
