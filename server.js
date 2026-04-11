@@ -1092,6 +1092,21 @@ setInterval(async () => {
   } catch (e) {}
 }, 5 * 60 * 1000);
 app.get('/api/admin/users', authMiddleware, async (req, res) => {
+  app.delete('/api/admin/user/:id', authMiddleware, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Not allowed' });
+    }
+
+    const { id } = req.params;
+
+    await User.findByIdAndDelete(id);
+
+    res.json({ success: true, message: 'User deleted' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
   app.get('/api/admin/orders', authMiddleware, async (req, res) => {
   try {
     if (req.user.role !== 'admin') {
