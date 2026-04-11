@@ -667,19 +667,21 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 function authMiddleware(req, res, next) {
-  const token = req.headers.authorization;
+  const authHeader = req.headers.authorization;
 
-  if (!token) {
-    return res.status(401).json({ error: 'No token' });
-  }
+if (!authHeader || !authHeader.startsWith("Bearer ")) {
+  return res.status(401).json({ error: "Unauthorized" });
+}
 
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
-    next();
-  } catch (err) {
-    return res.status(401).json({ error: 'Invalid token' });
-  }
+const token = authHeader.split(" ")[1];
+
+try {
+  const decoded = jwt.verify(token, JWT_SECRET);
+  req.user = decoded;
+  next();
+} catch (err) {
+  return res.status(401).json({ error: "Invalid token" });
+}
 }
 app.post('/api/order', authMiddleware, async (req, res) => {
   try {
