@@ -521,14 +521,14 @@ mongoose.connection.once('open', () => {
     let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0 };
 
     const allRuns = await Run.find({ 
-      status: { $nin: ['completed', 'failed', 'cancelled', 'processing'] }
+      status: { $nin: ['completed', 'failed', 'cancelled', 'processing', 'queued'] }
     });
 
     for (let run of allRuns) {
       if (
   run.status === 'queued' ||
   run.status === 'processing' ||
-  run.status === 'completed'
+  run.status === 'completed' ||   
   isRunInQueue(run.id)
 ) continue;
       const order = await Order.findOne({ schedulerOrderId: run.schedulerOrderId });
