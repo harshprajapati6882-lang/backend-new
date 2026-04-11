@@ -200,7 +200,8 @@ if (!order || order.status === 'cancelled') {
 const activeSameType = await Run.findOne({
   link: run.link,
   label: run.label,
-  status: { $in: ['processing'] }
+  status: { $in: ['processing'] },
+schedulerOrderId: run.schedulerOrderId
 });
 
 if (activeSameType && activeSameType._id.toString() !== run._id.toString()) {
