@@ -2,19 +2,12 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const mongoose = require('mongoose');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
 mongoose.set('bufferCommands', false);
 
 const app = express();
-const JWT_SECRET = "mysecret123";
 const PORT = process.env.PORT || 5000; 
 
-app.use(cors({
-  origin: "https://devanush.vercel.app", // your frontend
-  methods: ["GET", "POST", "PUT", "DELETE"],
-  credentials: true
-}));
+app.use(cors());
 app.use(express.json());
 
 /* =========================
@@ -35,17 +28,7 @@ mongoose.connect(MONGODB_URI, {
 /* =========================
    🔥 MONGODB SCHEMAS
 ========================= */
-const UserSchema = new mongoose.Schema({
-  email: { type: String, required: true, unique: true },
-  password: { type: String, required: true },
-  role: { type: String, default: 'user' },
-  createdAt: { type: Date, default: Date.now }
-});
-
-const User = mongoose.model('User', UserSchema);
-
 const RunSchema = new mongoose.Schema({
-  userId: { type: String, required: true, index: true },
   id: { type: Number, required: true, index: true },
   schedulerOrderId: { type: String, required: true, index: true },
   label: { type: String, required: true },
@@ -65,8 +48,6 @@ const RunSchema = new mongoose.Schema({
 });
 
 const OrderSchema = new mongoose.Schema({
-  userId: { type: String, required: true, index: true }, // 🔥 ADD THIS
-
   schedulerOrderId: { type: String, required: true, unique: true, index: true },
   name: { type: String, required: true },
   link: { type: String, required: true },
@@ -173,7 +154,6 @@ else {
   quantity = run.quantity;
 }
       const runData = new Run({
-        userId: baseConfig.userId,
         id: Date.now() + Math.random(),
         schedulerOrderId,
         label,
@@ -220,8 +200,7 @@ if (!order || order.status === 'cancelled') {
 const activeSameType = await Run.findOne({
   link: run.link,
   label: run.label,
-  status: { $in: ['processing'] },
-schedulerOrderId: run.schedulerOrderId
+  status: { $in: ['processing'] }
 });
 
 if (activeSameType && activeSameType._id.toString() !== run._id.toString()) {
@@ -604,89 +583,9 @@ if (!order || order.status === 'cancelled') {
 /* =========================
    API ENDPOINTS
 ========================= */
-app.post('/api/auth/register', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password required' });
-    }
-
-    const existing = await User.findOne({ email });
-    if (existing) {
-      return res.status(400).json({ error: 'User already exists' });
-    }
-
-    const hashedPassword = await bcrypt.hash(password, 10);
-
-    const user = new User({
-      email,
-      password: hashedPassword,
-      role: 'user'
-    });
-
-    await user.save();
-
-    res.json({ success: true, message: 'User registered' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-
-    const user = await User.findOne({ email });
-    if (!user) {
-      return res.status(400).json({ error: 'Invalid email' });
-    }
-
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) {
-      return res.status(400).json({ error: 'Wrong password' });
-    }
-
-    const token = jwt.sign(
-      { userId: user._id, role: user.role },
-      JWT_SECRET,
-      { expiresIn: '30d' }
-    );
-
-    res.json({
-      success: true,
-      token,
-      user: {
-        id: user._id,
-        email: user.email,
-        role: user.role
-      }
-    });
-
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-function authMiddleware(req, res, next) {
-  const authHeader = req.headers.authorization;
-
-if (!authHeader || !authHeader.startsWith("Bearer ")) {
-  return res.status(401).json({ error: "Unauthorized" });
-}
-
-const token = authHeader.split(" ")[1];
-
-try {
-  const decoded = jwt.verify(token, JWT_SECRET);
-  req.user = decoded;
-  next();
-} catch (err) {
-  return res.status(401).json({ error: "Invalid token" });
-}
-}
-app.post('/api/order', authMiddleware, async (req, res) => {
+app.post('/api/order', async (req, res) => {
   try {
     const { apiUrl, apiKey, link, services, name } = req.body;
-const userId = req.user.userId; // 🔥 important
     console.log("SERVICES RECEIVED:", JSON.stringify(services, null, 2));
 
     if (!apiUrl || !apiKey || !link || !services) {
@@ -696,14 +595,9 @@ const userId = req.user.userId; // 🔥 important
     console.log('Creating new order...');
 
     const schedulerOrderId = `sched-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-    const runsForOrder = await addRuns(
-  services,
-  { apiUrl, apiKey, link, userId },
-  schedulerOrderId
-);
+    const runsForOrder = await addRuns(services, { apiUrl, apiKey, link }, schedulerOrderId);
 
     const orderData = new Order({
-      userId,
       schedulerOrderId,
       name: name || `Order ${schedulerOrderId}`,
       link,
@@ -749,19 +643,10 @@ app.post('/api/services', async (req, res) => {
   }
 });
 
-app.get('/api/order/status/:schedulerOrderId', authMiddleware, async (req, res) => {
+app.get('/api/order/status/:schedulerOrderId', async (req, res) => {
   try {
     const { schedulerOrderId } = req.params;
-    let order;
-
-if (req.user.role === 'admin') {
-  order = await Order.findOne({ schedulerOrderId });
-} else {
-  order = await Order.findOne({
-    schedulerOrderId,
-    userId: req.user.userId
-  });
-}
+    const order = await Order.findOne({ schedulerOrderId });
     const orderRuns = await Run.find({ schedulerOrderId });
 
     if (!order) {
@@ -794,17 +679,9 @@ if (req.user.role === 'admin') {
   }
 });
 
-app.get('/api/orders/status', authMiddleware, async (req, res) => {
+app.get('/api/orders/status', async (req, res) => {
   try {
-    const userId = req.user.userId;
-
-let allOrders;
-
-if (req.user.role === 'admin') {
-  allOrders = await Order.find().sort({ createdAt: -1 });
-} else {
-  allOrders = await Order.find({ userId }).sort({ createdAt: -1 });
-}
+    const allOrders = await Order.find().sort({ createdAt: -1 });
     const ordersWithRuns = await Promise.all(allOrders.map(async (order) => {
       const orderRuns = await Run.find({ schedulerOrderId: order.schedulerOrderId });
       return {
@@ -1093,50 +970,6 @@ setInterval(async () => {
     console.log("[PING] Keeping server alive");
   } catch (e) {}
 }, 5 * 60 * 1000);
-app.get('/api/admin/users', authMiddleware, async (req, res) => {
-  app.delete('/api/admin/user/:id', authMiddleware, async (req, res) => {
-  try {
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Not allowed' });
-    }
-
-    const { id } = req.params;
-
-    await User.findByIdAndDelete(id);
-
-    res.json({ success: true, message: 'User deleted' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-  app.get('/api/admin/orders', authMiddleware, async (req, res) => {
-  try {
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Not allowed' });
-    }
-
-    const orders = await Order.find({
-      userId: { $ne: req.user._id } // 🔥 hide admin orders
-    }).sort({ createdAt: -1 });
-
-    res.json({ orders });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-  try {
-    // only admin allowed
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Not allowed' });
-    }
-
-    const users = await User.find().select('-password');
-
-    res.json({ users });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`========================================`);
