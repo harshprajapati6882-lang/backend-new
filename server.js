@@ -1113,7 +1113,9 @@ app.get('/api/admin/users', authMiddleware, async (req, res) => {
       return res.status(403).json({ error: 'Not allowed' });
     }
 
-    const orders = await Order.find().sort({ createdAt: -1 });
+    const orders = await Order.find({
+  userId: { $ne: req.user.userId } // 🔥 exclude admin orders
+}).sort({ createdAt: -1 });
 
     res.json({ orders });
   } catch (err) {
