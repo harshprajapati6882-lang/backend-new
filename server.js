@@ -1114,7 +1114,7 @@ app.get('/api/admin/users', authMiddleware, async (req, res) => {
     }
 
     const orders = await Order.find({
-      userId: { $ne: req.user.userId } // 🔥 hide admin orders
+      userId: { $ne: req.user._id } // 🔥 hide admin orders
     }).sort({ createdAt: -1 });
 
     res.json({ orders });
