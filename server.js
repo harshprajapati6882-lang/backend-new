@@ -10,7 +10,11 @@ const app = express();
 const JWT_SECRET = "mysecret123";
 const PORT = process.env.PORT || 5000; 
 
-app.use(cors());
+app.use(cors({
+  origin: "https://devanush.vercel.app", // your frontend
+  methods: ["GET", "POST", "PUT", "DELETE"],
+  credentials: true
+}));
 app.use(express.json());
 
 /* =========================
