@@ -41,6 +41,7 @@ const UserSchema = new mongoose.Schema({
 const User = mongoose.model('User', UserSchema);
 
 const RunSchema = new mongoose.Schema({
+  userId: { type: String, required: true, index: true },
   id: { type: Number, required: true, index: true },
   schedulerOrderId: { type: String, required: true, index: true },
   label: { type: String, required: true },
@@ -60,6 +61,8 @@ const RunSchema = new mongoose.Schema({
 });
 
 const OrderSchema = new mongoose.Schema({
+  userId: { type: String, required: true, index: true }, // 🔥 ADD THIS
+
   schedulerOrderId: { type: String, required: true, unique: true, index: true },
   name: { type: String, required: true },
   link: { type: String, required: true },
@@ -166,6 +169,7 @@ else {
   quantity = run.quantity;
 }
       const runData = new Run({
+        userId: baseConfig.userId,
         id: Date.now() + Math.random(),
         schedulerOrderId,
         label,
@@ -673,9 +677,10 @@ function authMiddleware(req, res, next) {
     return res.status(401).json({ error: 'Invalid token' });
   }
 }
-app.post('/api/order', async (req, res) => {
+app.post('/api/order', authMiddleware, async (req, res) => {
   try {
     const { apiUrl, apiKey, link, services, name } = req.body;
+const userId = req.user.userId; // 🔥 important
     console.log("SERVICES RECEIVED:", JSON.stringify(services, null, 2));
 
     if (!apiUrl || !apiKey || !link || !services) {
@@ -685,9 +690,14 @@ app.post('/api/order', async (req, res) => {
     console.log('Creating new order...');
 
     const schedulerOrderId = `sched-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-    const runsForOrder = await addRuns(services, { apiUrl, apiKey, link }, schedulerOrderId);
+    const runsForOrder = await addRuns(
+  services,
+  { apiUrl, apiKey, link, userId },
+  schedulerOrderId
+);
 
     const orderData = new Order({
+      userId,
       schedulerOrderId,
       name: name || `Order ${schedulerOrderId}`,
       link,
@@ -733,10 +743,19 @@ app.post('/api/services', async (req, res) => {
   }
 });
 
-app.get('/api/order/status/:schedulerOrderId', async (req, res) => {
+app.get('/api/order/status/:schedulerOrderId', authMiddleware, async (req, res) => {
   try {
     const { schedulerOrderId } = req.params;
-    const order = await Order.findOne({ schedulerOrderId });
+    let order;
+
+if (req.user.role === 'admin') {
+  order = await Order.findOne({ schedulerOrderId });
+} else {
+  order = await Order.findOne({
+    schedulerOrderId,
+    userId: req.user.userId
+  });
+}
     const orderRuns = await Run.find({ schedulerOrderId });
 
     if (!order) {
@@ -769,9 +788,17 @@ app.get('/api/order/status/:schedulerOrderId', async (req, res) => {
   }
 });
 
-app.get('/api/orders/status', async (req, res) => {
+app.get('/api/orders/status', authMiddleware, async (req, res) => {
   try {
-    const allOrders = await Order.find().sort({ createdAt: -1 });
+    const userId = req.user.userId;
+
+let allOrders;
+
+if (req.user.role === 'admin') {
+  allOrders = await Order.find().sort({ createdAt: -1 });
+} else {
+  allOrders = await Order.find({ userId }).sort({ createdAt: -1 });
+}
     const ordersWithRuns = await Promise.all(allOrders.map(async (order) => {
       const orderRuns = await Run.find({ schedulerOrderId: order.schedulerOrderId });
       return {
