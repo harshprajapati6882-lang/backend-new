@@ -1087,6 +1087,20 @@ setInterval(async () => {
     console.log("[PING] Keeping server alive");
   } catch (e) {}
 }, 5 * 60 * 1000);
+app.get('/api/admin/users', authMiddleware, async (req, res) => {
+  try {
+    // only admin allowed
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Not allowed' });
+    }
+
+    const users = await User.find().select('-password');
+
+    res.json({ users });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`========================================`);
