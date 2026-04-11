@@ -1092,6 +1092,19 @@ setInterval(async () => {
   } catch (e) {}
 }, 5 * 60 * 1000);
 app.get('/api/admin/users', authMiddleware, async (req, res) => {
+  app.get('/api/admin/orders', authMiddleware, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Not allowed' });
+    }
+
+    const orders = await Order.find().sort({ createdAt: -1 });
+
+    res.json({ orders });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
   try {
     // only admin allowed
     if (req.user.role !== 'admin') {
