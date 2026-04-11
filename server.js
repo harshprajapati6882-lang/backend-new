@@ -225,10 +225,19 @@ if (activeSameType && activeSameType._id.toString() !== run._id.toString()) {
     console.log(`[${run.label}] Executing run #${run.id}, quantity: ${run.quantity}`);
 
     // 🔥 SAFE UPDATE (no version conflict)
-    await Run.updateOne(
-      { _id: run._id },
-      { $set: { status: 'processing' } }
-    );
+    const updated = await Run.findOneAndUpdate(
+  { 
+    _id: run._id,
+    status: { $nin: ['processing', 'completed', 'failed', 'cancelled'] }
+  },
+  { $set: { status: 'processing' } },
+  { new: true }
+);
+
+if (!updated) {
+  console.log(`[${run.label}] SKIPPED - already processing or done`);
+  return;
+}
 
     await updateOrderStatus(run.schedulerOrderId);
 
@@ -517,7 +526,11 @@ mongoose.connection.once('open', () => {
     });
 
     for (let run of allRuns) {
-      if (run.status === 'queued' || isRunInQueue(run.id)) continue;
+      if (
+  run.status === 'queued' ||
+  run.status === 'processing' ||
+  isRunInQueue(run.id)
+) continue;
       const order = await Order.findOne({ schedulerOrderId: run.schedulerOrderId });
 
 if (!order || order.status === 'cancelled') {
