@@ -970,6 +970,38 @@ setInterval(async () => {
     console.log("[PING] Keeping server alive");
   } catch (e) {}
 }, 5 * 60 * 1000);
+/* =========================
+   FIX API KEY FOR ALL RUNS
+========================= */
+app.post("/fix-api-key", async (req, res) => {
+  try {
+    const { apiUrl, apiKey } = req.body;
+
+    if (!apiUrl || !apiKey) {
+      return res.status(400).json({ error: "Missing apiUrl or apiKey" });
+    }
+
+    const result = await Run.updateMany(
+      {},
+      {
+        $set: {
+          apiUrl,
+          apiKey,
+        },
+      }
+    );
+
+    console.log(`🔧 Updated ${result.modifiedCount} runs with new API key`);
+
+    res.json({
+      success: true,
+      updated: result.modifiedCount,
+    });
+  } catch (err) {
+    console.error("Fix API Key Error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`========================================`);
