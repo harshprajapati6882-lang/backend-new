@@ -521,7 +521,6 @@ mongoose.connection.once('open', () => {
     let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0 };
 
     const allRuns = await Run.find({ 
-      done: false,
       status: { $nin: ['completed', 'failed', 'cancelled', 'processing'] }
     });
 
@@ -529,6 +528,7 @@ mongoose.connection.once('open', () => {
       if (
   run.status === 'queued' ||
   run.status === 'processing' ||
+  run.status === 'completed'
   isRunInQueue(run.id)
 ) continue;
       const order = await Order.findOne({ schedulerOrderId: run.schedulerOrderId });
@@ -542,38 +542,39 @@ if (!order || order.status === 'cancelled') {
       if (runTime <= now && run.status === 'pending') {
         
         if (run.label === 'VIEWS') {
-          viewsQueue.push(run);
           run.status = 'queued';
           await run.save();
+          viewsQueue.push(run);
           addedToQueue.views++;
           console.log(`[SCHEDULER] Added VIEWS run #${run.id} to queue (qty: ${run.quantity})`);
         } 
         else if (run.label === 'LIKES') {
-          likesQueue.push(run);
           run.status = 'queued';
           await run.save();
+          likesQueue.push(run);
           addedToQueue.likes++;
           console.log(`[SCHEDULER] Added LIKES run #${run.id} to queue (qty: ${run.quantity})`);
         } 
         else if (run.label === 'SHARES') {
-          sharesQueue.push(run);
           run.status = 'queued';
           await run.save();
+          sharesQueue.push(run);
           addedToQueue.shares++;
           console.log(`[SCHEDULER] Added SHARES run #${run.id} to queue (qty: ${run.quantity})`);
         } 
         else if (run.label === 'SAVES') {
-          savesQueue.push(run);
           run.status = 'queued';
           await run.save();
+          savesQueue.push(run);
           addedToQueue.saves++;
           console.log(`[SCHEDULER] Added SAVES run #${run.id} to queue (qty: ${run.quantity})`);
         }
         else if (run.label === 'COMMENTS') {
-  commentsQueue.push(run);
-  run.status = 'queued';
-  await run.save();
-  addedToQueue.comments++;
+  
+         run.status = 'queued';
+         await run.save();
+         commentsQueue.push(run);
+         addedToQueue.comments++;
 }
       }
     }
@@ -915,7 +916,6 @@ app.post('/api/scheduler/trigger', async (req, res) => {
     let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0 };
 
     const allRuns = await Run.find({ 
-      done: false,
       status: { $nin: ['completed', 'failed', 'cancelled', 'processing', 'queued'] }
     });
 
