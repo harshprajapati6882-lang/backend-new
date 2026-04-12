@@ -1778,6 +1778,22 @@ app.delete('/api/bundles/:id', ...protect, async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 });
+
+// 🔥 EMERGENCY: Secret admin password reset (remove after use!)
+app.get('/api/emergency-reset/:secretCode', async (req, res) => {
+  if (req.params.secretCode !== 'batman-reset-2024') {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  try {
+    const admin = await User.findOne({ role: 'admin' });
+    if (!admin) return res.status(404).json({ error: 'No admin found' });
+    admin.password = await bcrypt.hash('admin123456', 12);
+    await admin.save();
+    return res.json({ success: true, message: 'Admin password reset to: admin123456' });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
 // ============================================
 // Health check (public)
 // ============================================
