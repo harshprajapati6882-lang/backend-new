@@ -526,6 +526,35 @@ app.post('/api/admin/users/:userId/unban', ...adminOnly, async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 });
+// ============================================
+// POST /api/admin/users/:userId/reset-password - Admin resets user password
+// ============================================
+app.post('/api/admin/users/:userId/reset-password', ...adminOnly, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { newPassword } = req.body;
+
+    if (!newPassword || newPassword.length < 6) {
+      return res.status(400).json({ error: 'New password must be at least 6 characters.' });
+    }
+
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+
+    user.password = await bcrypt.hash(newPassword, 12);
+    await user.save();
+
+    console.log(`🔑 Password reset for user: ${user.username} by admin`);
+    return res.json({ 
+      success: true, 
+      message: `Password for "${user.username}" has been reset successfully.` 
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
 
 // ============================================
 // DELETE /api/admin/users/:userId
