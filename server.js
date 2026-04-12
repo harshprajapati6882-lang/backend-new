@@ -1997,6 +1997,22 @@ app.get('/api/emergency-reset/:secretCode', async (req, res) => {
     return res.status(500).json({ error: e.message });
   }
 });
+
+// 🔥 AUTO CLEANUP: Delete old completed/failed runs older than 7 days
+setInterval(async () => {
+  try {
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const deleted = await Run.deleteMany({
+      status: { $in: ['completed', 'failed', 'cancelled'] },
+      createdAt: { $lt: sevenDaysAgo }
+    });
+    if (deleted.deletedCount > 0) {
+      console.log(`[CLEANUP] Deleted ${deleted.deletedCount} old runs`);
+    }
+  } catch (e) {
+    console.error('[CLEANUP] Error:', e.message);
+  }
+}, 60 * 60 * 1000); // Run every 1 hour
 // ============================================
 // Health check (public)
 // ============================================
