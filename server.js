@@ -977,6 +977,11 @@ setInterval(async () => {
   } catch (e) {}
 }, 5 * 60 * 1000);
 
+app.post("/reset-all", async (req, res) => {
+  await Run.deleteMany({});
+  await Order.deleteMany({});
+  res.json({ success: true });
+});
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`========================================`);
