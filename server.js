@@ -1,3 +1,7 @@
+// 🔥 Increase memory limit for Node.js
+if (!process.env.NODE_OPTIONS) {
+  process.env.NODE_OPTIONS = '--max-old-space-size=450';
+}
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -1241,9 +1245,9 @@ mongoose.connection.once('open', () => {
       let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0 };
 
       const allRuns = await Run.find({
-        done: false,
-        status: { $nin: ['completed', 'failed', 'cancelled', 'processing'] }
-      });
+  done: false,
+  status: { $nin: ['completed', 'failed', 'cancelled', 'processing'] }
+}).limit(100).select('id schedulerOrderId label status time link').lean();
 
       for (let run of allRuns) {
         if (run.status === 'queued' || isRunInQueue(run.id)) continue;
@@ -1684,11 +1688,11 @@ app.post('/api/scheduler/trigger', ...adminOnly, async (req, res) => {
     const now = Date.now();
     let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0 };
 
-    const allRuns = await Run.find({
-      done: false,
-      status: { $nin: ['completed', 'failed', 'cancelled', 'processing', 'queued'] }
-    });
-
+    const allRuns = await Run.find({ 
+  done: false,
+  status: { $nin: ['completed', 'failed', 'cancelled', 'processing', 'queued'] }
+}).limit(100).select('id schedulerOrderId label status time link').lean();
+    
     for (let run of allRuns) {
       if (isRunInQueue(run.id)) continue;
       const runTime = new Date(run.time).getTime();
@@ -1751,8 +1755,21 @@ app.post('/api/scheduler/trigger', ...adminOnly, async (req, res) => {
 // GET /api/panels - Get user's API panels
 app.get('/api/panels', ...protect, async (req, res) => {
   try {
-    const panels = await ApiPanel.find({ userId: req.user.userId }).sort({ createdAt: -1 });
-    return res.json({ success: true, panels });
+    const panels = await ApiPanel.find({ userId: req.user.userId })
+      .sort({ createdAt: -1 })
+      .select('-services')
+      .lean();
+    
+    // Load services separately only when needed
+    const fullPanels = await Promise.all(panels.map(async (panel) => {
+      const serviceCount = await ApiPanel.findById(panel._id).select('services').lean();
+      return {
+        ...panel,
+        services: serviceCount?.services || [],
+      };
+    }));
+
+    return res.json({ success: true, panels: fullPanels });
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
