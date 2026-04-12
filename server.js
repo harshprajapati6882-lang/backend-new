@@ -1538,8 +1538,7 @@ app.post('/api/order/control', ...protect, async (req, res) => {
     if (action === 'resume') {
       for (let run of orderRuns) {
         if (run.status === 'paused') {
-          run.status = 'pending';
-          await run.save();
+          await Run.updateOne({ _id: run._id }, { $set: { status: 'pending' } });
         }
       }
       order.status = 'running';
@@ -1661,8 +1660,7 @@ app.post('/api/runs/retry-stuck', ...adminOnly, async (req, res) => {
         resetCount++;
       }
       if (run.status === 'queued' && !isRunInQueue(run.id)) {
-        run.status = 'pending';
-        await run.save();
+        await Run.updateOne({ _id: run._id }, { $set: { status: 'pending' } });
         resetCount++;
       }
     }
