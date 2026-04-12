@@ -31,7 +31,8 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(cookieParser());
 
 /* =========================
@@ -1676,6 +1677,7 @@ app.post('/api/panels/:id/toggle', ...protect, async (req, res) => {
 });
 
 // POST /api/panels/:id/services - Save fetched services to panel
+// POST /api/panels/:id/services - Save fetched services to panel
 app.post('/api/panels/:id/services', ...protect, async (req, res) => {
   try {
     const { id } = req.params;
@@ -1688,12 +1690,25 @@ app.post('/api/panels/:id/services', ...protect, async (req, res) => {
       return res.status(403).json({ error: 'Access denied.' });
     }
 
-    panel.services = services || [];
+    // 🔥 Only save essential fields to reduce size
+    const cleanServices = (services || []).map(s => ({
+      id: s.id || '',
+      name: s.name || '',
+      type: s.type || '',
+      rate: s.rate || '',
+      min: s.min || 0,
+      max: s.max || 0,
+    }));
+
+    panel.services = cleanServices;
     panel.lastFetchAt = new Date().toISOString();
     panel.lastFetchError = null;
     await panel.save();
+    
+    console.log(`✅ Saved ${cleanServices.length} services for panel: ${panel.name}`);
     return res.json({ success: true, panel });
   } catch (error) {
+    console.error('[Save Services] Error:', error);
     return res.status(500).json({ error: error.message });
   }
 });
