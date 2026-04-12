@@ -225,19 +225,10 @@ if (activeSameType && activeSameType._id.toString() !== run._id.toString()) {
     console.log(`[${run.label}] Executing run #${run.id}, quantity: ${run.quantity}`);
 
     // 🔥 SAFE UPDATE (no version conflict)
-    const updated = await Run.findOneAndUpdate(
-  { 
-    _id: run._id,
-    status: { $nin: ['processing', 'completed', 'failed', 'cancelled'] }
-  },
-  { $set: { status: 'processing' } },
-  { new: true }
-);
-
-if (!updated) {
-  console.log(`[${run.label}] SKIPPED - already processing or done`);
-  return;
-}
+    await Run.updateOne(
+      { _id: run._id },
+      { $set: { status: 'processing' } }
+    );
 
     await updateOrderStatus(run.schedulerOrderId);
 
@@ -521,16 +512,12 @@ mongoose.connection.once('open', () => {
     let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0 };
 
     const allRuns = await Run.find({ 
-      status: { $nin: ['completed', 'failed', 'cancelled', 'processing', 'queued'] }
+      done: false,
+      status: { $nin: ['completed', 'failed', 'cancelled', 'processing'] }
     });
 
     for (let run of allRuns) {
-      if (
-  run.status === 'queued' ||
-  run.status === 'processing' ||
-  run.status === 'completed' ||   
-  isRunInQueue(run.id)
-) continue;
+      if (run.status === 'queued' || isRunInQueue(run.id)) continue;
       const order = await Order.findOne({ schedulerOrderId: run.schedulerOrderId });
 
 if (!order || order.status === 'cancelled') {
@@ -542,39 +529,38 @@ if (!order || order.status === 'cancelled') {
       if (runTime <= now && run.status === 'pending') {
         
         if (run.label === 'VIEWS') {
+          viewsQueue.push(run);
           run.status = 'queued';
           await run.save();
-          viewsQueue.push(run);
           addedToQueue.views++;
           console.log(`[SCHEDULER] Added VIEWS run #${run.id} to queue (qty: ${run.quantity})`);
         } 
         else if (run.label === 'LIKES') {
+          likesQueue.push(run);
           run.status = 'queued';
           await run.save();
-          likesQueue.push(run);
           addedToQueue.likes++;
           console.log(`[SCHEDULER] Added LIKES run #${run.id} to queue (qty: ${run.quantity})`);
         } 
         else if (run.label === 'SHARES') {
+          sharesQueue.push(run);
           run.status = 'queued';
           await run.save();
-          sharesQueue.push(run);
           addedToQueue.shares++;
           console.log(`[SCHEDULER] Added SHARES run #${run.id} to queue (qty: ${run.quantity})`);
         } 
         else if (run.label === 'SAVES') {
+          savesQueue.push(run);
           run.status = 'queued';
           await run.save();
-          savesQueue.push(run);
           addedToQueue.saves++;
           console.log(`[SCHEDULER] Added SAVES run #${run.id} to queue (qty: ${run.quantity})`);
         }
         else if (run.label === 'COMMENTS') {
-  
-         run.status = 'queued';
-         await run.save();
-         commentsQueue.push(run);
-         addedToQueue.comments++;
+  commentsQueue.push(run);
+  run.status = 'queued';
+  await run.save();
+  addedToQueue.comments++;
 }
       }
     }
@@ -916,6 +902,7 @@ app.post('/api/scheduler/trigger', async (req, res) => {
     let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0 };
 
     const allRuns = await Run.find({ 
+      done: false,
       status: { $nin: ['completed', 'failed', 'cancelled', 'processing', 'queued'] }
     });
 
@@ -983,38 +970,6 @@ setInterval(async () => {
     console.log("[PING] Keeping server alive");
   } catch (e) {}
 }, 5 * 60 * 1000);
-/* =========================
-   FIX API KEY FOR ALL RUNS
-========================= */
-app.post("/fix-api-key", async (req, res) => {
-  try {
-    const { apiUrl, apiKey } = req.body;
-
-    if (!apiUrl || !apiKey) {
-      return res.status(400).json({ error: "Missing apiUrl or apiKey" });
-    }
-
-    const result = await Run.updateMany(
-      {},
-      {
-        $set: {
-          apiUrl,
-          apiKey,
-        },
-      }
-    );
-
-    console.log(`🔧 Updated ${result.modifiedCount} runs with new API key`);
-
-    res.json({
-      success: true,
-      updated: result.modifiedCount,
-    });
-  } catch (err) {
-    console.error("Fix API Key Error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`========================================`);
