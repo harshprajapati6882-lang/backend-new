@@ -108,6 +108,40 @@ const OrderSchema = new mongoose.Schema({
   lastUpdatedAt: { type: Date, default: Date.now },
 });
 
+// ============================================
+// 🔗 API PANEL SCHEMA - NEW
+// ============================================
+const ApiPanelSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  name: { type: String, required: true, trim: true },
+  url: { type: String, required: true, trim: true },
+  key: { type: String, required: true },
+  status: { type: String, enum: ['Active', 'Inactive'], default: 'Active' },
+  services: { type: Array, default: [] },
+  lastFetchAt: { type: String, default: null },
+  lastFetchError: { type: String, default: null },
+  createdAt: { type: Date, default: Date.now },
+});
+
+// ============================================
+// 📁 BUNDLE SCHEMA - NEW
+// ============================================
+const BundleSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  name: { type: String, required: true, trim: true },
+  apiId: { type: String, required: true },
+  serviceIds: {
+    views: { type: String, default: '' },
+    likes: { type: String, default: '' },
+    shares: { type: String, default: '' },
+    saves: { type: String, default: '' },
+    comments: { type: String, default: '' },
+  },
+  createdAt: { type: Date, default: Date.now },
+});
+
+const ApiPanel = mongoose.model('ApiPanel', ApiPanelSchema);
+const Bundle = mongoose.model('Bundle', BundleSchema);
 const Run = mongoose.model('Run', RunSchema);
 const Order = mongoose.model('Order', OrderSchema);
 
@@ -1509,7 +1543,212 @@ app.post('/api/scheduler/trigger', ...adminOnly, async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 });
+/* =========================
+   🔗 API PANEL ENDPOINTS
+========================= */
 
+// GET /api/panels - Get user's API panels
+app.get('/api/panels', ...protect, async (req, res) => {
+  try {
+    const panels = await ApiPanel.find({ userId: req.user.userId }).sort({ createdAt: -1 });
+    return res.json({ success: true, panels });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/panels - Add new API panel
+app.post('/api/panels', ...protect, async (req, res) => {
+  try {
+    const { name, url, key } = req.body;
+
+    if (!name || !url || !key) {
+      return res.status(400).json({ error: 'Name, URL, and Key are required.' });
+    }
+
+    const panel = new ApiPanel({
+      userId: req.user.userId,
+      name: name.trim(),
+      url: url.trim(),
+      key: key.trim(),
+      status: 'Active',
+      services: [],
+    });
+
+    await panel.save();
+    console.log(`✅ API Panel created: ${name} by ${req.user.username}`);
+    return res.json({ success: true, panel });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// PUT /api/panels/:id - Update API panel
+app.put('/api/panels/:id', ...protect, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, url, key } = req.body;
+
+    const panel = await ApiPanel.findById(id);
+    if (!panel) return res.status(404).json({ error: 'Panel not found.' });
+
+    if (panel.userId.toString() !== req.user.userId && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+
+    if (name) panel.name = name.trim();
+    if (url) panel.url = url.trim();
+    if (key) panel.key = key.trim();
+
+    await panel.save();
+    return res.json({ success: true, panel });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// DELETE /api/panels/:id - Delete API panel
+app.delete('/api/panels/:id', ...protect, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const panel = await ApiPanel.findById(id);
+    if (!panel) return res.status(404).json({ error: 'Panel not found.' });
+
+    if (panel.userId.toString() !== req.user.userId && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+
+    await ApiPanel.findByIdAndDelete(id);
+    return res.json({ success: true, message: 'Panel deleted.' });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/panels/:id/toggle - Toggle panel status
+app.post('/api/panels/:id/toggle', ...protect, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const panel = await ApiPanel.findById(id);
+    if (!panel) return res.status(404).json({ error: 'Panel not found.' });
+
+    if (panel.userId.toString() !== req.user.userId && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+
+    panel.status = panel.status === 'Active' ? 'Inactive' : 'Active';
+    await panel.save();
+    return res.json({ success: true, panel });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/panels/:id/services - Save fetched services to panel
+app.post('/api/panels/:id/services', ...protect, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { services } = req.body;
+
+    const panel = await ApiPanel.findById(id);
+    if (!panel) return res.status(404).json({ error: 'Panel not found.' });
+
+    if (panel.userId.toString() !== req.user.userId && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+
+    panel.services = services || [];
+    panel.lastFetchAt = new Date().toISOString();
+    panel.lastFetchError = null;
+    await panel.save();
+    return res.json({ success: true, panel });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+/* =========================
+   📁 BUNDLE ENDPOINTS
+========================= */
+
+// GET /api/bundles - Get user's bundles
+app.get('/api/bundles', ...protect, async (req, res) => {
+  try {
+    const bundles = await Bundle.find({ userId: req.user.userId }).sort({ createdAt: -1 });
+    return res.json({ success: true, bundles });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/bundles - Add new bundle
+app.post('/api/bundles', ...protect, async (req, res) => {
+  try {
+    const { name, apiId, serviceIds } = req.body;
+
+    if (!name || !apiId) {
+      return res.status(400).json({ error: 'Name and API ID are required.' });
+    }
+
+    const bundle = new Bundle({
+      userId: req.user.userId,
+      name: name.trim(),
+      apiId,
+      serviceIds: serviceIds || { views: '', likes: '', shares: '', saves: '', comments: '' },
+    });
+
+    await bundle.save();
+    console.log(`✅ Bundle created: ${name} by ${req.user.username}`);
+    return res.json({ success: true, bundle });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// PUT /api/bundles/:id - Update bundle
+app.put('/api/bundles/:id', ...protect, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, apiId, serviceIds } = req.body;
+
+    const bundle = await Bundle.findById(id);
+    if (!bundle) return res.status(404).json({ error: 'Bundle not found.' });
+
+    if (bundle.userId.toString() !== req.user.userId && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+
+    if (name) bundle.name = name.trim();
+    if (apiId) bundle.apiId = apiId;
+    if (serviceIds) bundle.serviceIds = serviceIds;
+
+    await bundle.save();
+    return res.json({ success: true, bundle });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// DELETE /api/bundles/:id - Delete bundle
+app.delete('/api/bundles/:id', ...protect, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const bundle = await Bundle.findById(id);
+    if (!bundle) return res.status(404).json({ error: 'Bundle not found.' });
+
+    if (bundle.userId.toString() !== req.user.userId && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+
+    await Bundle.findByIdAndDelete(id);
+    return res.json({ success: true, message: 'Bundle deleted.' });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
 // ============================================
 // Health check (public)
 // ============================================
