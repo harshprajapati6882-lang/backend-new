@@ -1239,60 +1239,56 @@ function isRunInQueue(runId) {
 mongoose.connection.once('open', () => {
   console.log("🚀 Scheduler started after DB connected");
 
+  mongoose.connection.once('open', () => {
+  console.log("🚀 Scheduler started after DB connected");
+
   setInterval(async () => {
     try {
       const now = Date.now();
       let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0 };
 
+      // 🔥 FIX: Don't use .lean() here - we need to update status using updateOne instead
       const allRuns = await Run.find({
-  done: false,
-  status: { $nin: ['completed', 'failed', 'cancelled', 'processing'] }
-}).limit(100).select('id schedulerOrderId label status time link').lean();
+        done: false,
+        status: { $nin: ['completed', 'failed', 'cancelled', 'processing', 'queued'] }
+      }).limit(100);
 
       for (let run of allRuns) {
         if (run.status === 'queued' || isRunInQueue(run.id)) continue;
+        
         const order = await Order.findOne({ schedulerOrderId: run.schedulerOrderId });
-
-        if (!order || order.status === 'cancelled') {
-          continue;
-        }
+        if (!order || order.status === 'cancelled') continue;
 
         const runTime = new Date(run.time).getTime();
 
         if (runTime <= now && run.status === 'pending') {
+          // 🔥 FIX: Use updateOne instead of run.save()
+          await Run.updateOne({ _id: run._id }, { $set: { status: 'queued' } });
+
           if (run.label === 'VIEWS') {
             viewsQueue.push(run);
-            run.status = 'queued';
-            await run.save();
             addedToQueue.views++;
             console.log(`[SCHEDULER] Added VIEWS run #${run.id} to queue (qty: ${run.quantity})`);
           }
           else if (run.label === 'LIKES') {
             likesQueue.push(run);
-            run.status = 'queued';
-            await run.save();
             addedToQueue.likes++;
             console.log(`[SCHEDULER] Added LIKES run #${run.id} to queue (qty: ${run.quantity})`);
           }
           else if (run.label === 'SHARES') {
             sharesQueue.push(run);
-            run.status = 'queued';
-            await run.save();
             addedToQueue.shares++;
             console.log(`[SCHEDULER] Added SHARES run #${run.id} to queue (qty: ${run.quantity})`);
           }
           else if (run.label === 'SAVES') {
             savesQueue.push(run);
-            run.status = 'queued';
-            await run.save();
             addedToQueue.saves++;
             console.log(`[SCHEDULER] Added SAVES run #${run.id} to queue (qty: ${run.quantity})`);
           }
           else if (run.label === 'COMMENTS') {
             commentsQueue.push(run);
-            run.status = 'queued';
-            await run.save();
             addedToQueue.comments++;
+            console.log(`[SCHEDULER] Added COMMENTS run #${run.id} to queue`);
           }
         }
       }
@@ -1310,6 +1306,7 @@ mongoose.connection.once('open', () => {
       console.error('[SCHEDULER] Error:', error);
     }
   }, 10000);
+});
 });
 
 /* =========================
@@ -1691,7 +1688,7 @@ app.post('/api/scheduler/trigger', ...adminOnly, async (req, res) => {
     const allRuns = await Run.find({ 
   done: false,
   status: { $nin: ['completed', 'failed', 'cancelled', 'processing', 'queued'] }
-}).limit(100).select('id schedulerOrderId label status time link').lean();
+}).limit(100);
     
     for (let run of allRuns) {
       if (isRunInQueue(run.id)) continue;
@@ -1700,28 +1697,23 @@ app.post('/api/scheduler/trigger', ...adminOnly, async (req, res) => {
       if (runTime <= now && run.status === 'pending') {
         if (run.label === 'VIEWS') {
           viewsQueue.push(run);
-          run.status = 'queued';
-          await run.save();
+          await Run.updateOne({ _id: run._id }, { $set: { status: 'queued' } });
           addedToQueue.views++;
         } else if (run.label === 'LIKES') {
           likesQueue.push(run);
-          run.status = 'queued';
-          await run.save();
+          await Run.updateOne({ _id: run._id }, { $set: { status: 'queued' } });
           addedToQueue.likes++;
         } else if (run.label === 'SHARES') {
           sharesQueue.push(run);
-          run.status = 'queued';
-          await run.save();
+          await Run.updateOne({ _id: run._id }, { $set: { status: 'queued' } });
           addedToQueue.shares++;
         } else if (run.label === 'SAVES') {
           savesQueue.push(run);
-          run.status = 'queued';
-          await run.save();
+          await Run.updateOne({ _id: run._id }, { $set: { status: 'queued' } });
           addedToQueue.saves++;
         } else if (run.label === 'COMMENTS') {
           commentsQueue.push(run);
-          run.status = 'queued';
-          await run.save();
+          await Run.updateOne({ _id: run._id }, { $set: { status: 'queued' } });
           addedToQueue.comments++;
         }
       }
