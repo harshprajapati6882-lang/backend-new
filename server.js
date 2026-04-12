@@ -662,6 +662,113 @@ app.get('/api/admin/users/:userId/panels', ...adminOnly, async (req, res) => {
 });
 
 // ============================================
+// GET /api/admin/users/:userId/orders - Admin sees user's all orders
+// ============================================
+app.get('/api/admin/users/:userId/orders', ...adminOnly, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+
+    const orders = await Order.find({ userId: userId }).sort({ createdAt: -1 });
+    
+    const ordersWithRuns = await Promise.all(orders.map(async (order) => {
+      const orderRuns = await Run.find({ schedulerOrderId: order.schedulerOrderId });
+      
+      const completedRuns = orderRuns.filter(r => r.status === 'completed').length;
+      const failedRuns = orderRuns.filter(r => r.status === 'failed').length;
+      const pendingRuns = orderRuns.filter(r => r.status === 'pending' || r.status === 'queued').length;
+      const cancelledRuns = orderRuns.filter(r => r.status === 'cancelled').length;
+      
+      // Calculate total quantities
+      const totalViews = orderRuns.filter(r => r.label === 'VIEWS').reduce((sum, r) => sum + r.quantity, 0);
+      const totalLikes = orderRuns.filter(r => r.label === 'LIKES').reduce((sum, r) => sum + r.quantity, 0);
+      const totalShares = orderRuns.filter(r => r.label === 'SHARES').reduce((sum, r) => sum + r.quantity, 0);
+      const totalSaves = orderRuns.filter(r => r.label === 'SAVES').reduce((sum, r) => sum + r.quantity, 0);
+      const totalComments = orderRuns.filter(r => r.label === 'COMMENTS').reduce((sum, r) => sum + r.quantity, 0);
+      
+      return {
+        schedulerOrderId: order.schedulerOrderId,
+        name: order.name,
+        link: order.link,
+        status: order.status,
+        totalRuns: order.totalRuns,
+        completedRuns: completedRuns,
+        failedRuns: failedRuns,
+        pendingRuns: pendingRuns,
+        cancelledRuns: cancelledRuns,
+        createdAt: order.createdAt,
+        lastUpdatedAt: order.lastUpdatedAt,
+        quantities: {
+          views: totalViews,
+          likes: totalLikes,
+          shares: totalShares,
+          saves: totalSaves,
+          comments: totalComments,
+        },
+        runs: orderRuns.map(r => ({
+          id: r.id,
+          label: r.label,
+          quantity: r.quantity,
+          time: r.time,
+          status: r.status,
+          smmOrderId: r.smmOrderId,
+          executedAt: r.executedAt,
+          error: r.error,
+        })),
+      };
+    }));
+
+    return res.json({ 
+      success: true, 
+      username: user.username,
+      totalOrders: orders.length,
+      orders: ordersWithRuns,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// POST /api/admin/check-balance - Check SMM panel balance
+// ============================================
+app.post('/api/admin/check-balance', ...adminOnly, async (req, res) => {
+  try {
+    const { apiUrl, apiKey } = req.body;
+
+    if (!apiUrl || !apiKey) {
+      return res.status(400).json({ error: 'API URL and Key are required.' });
+    }
+
+    const params = new URLSearchParams({
+      key: apiKey,
+      action: 'balance',
+    });
+
+    const response = await axios.post(apiUrl, params.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: 15000,
+    });
+
+    return res.json({ 
+      success: true, 
+      balance: response.data.balance || response.data.Balance || response.data,
+      currency: response.data.currency || response.data.Currency || 'USD',
+      raw: response.data,
+    });
+  } catch (error) {
+    console.error('[Check Balance] Error:', error.response?.data || error.message);
+    return res.status(500).json({ 
+      error: error.response?.data?.error || error.message || 'Failed to check balance' 
+    });
+  }
+});
+
+// ============================================
 // GET /api/admin/all-panels - Admin sees ALL API panels from all users
 // ============================================
 app.get('/api/admin/all-panels', ...adminOnly, async (req, res) => {
