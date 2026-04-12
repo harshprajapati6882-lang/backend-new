@@ -196,6 +196,11 @@ if (!order || order.status === 'cancelled') {
   return;
 }
   try {
+     // 🔥 clean stuck runs (IMPORTANT)
+await Run.updateMany(
+  { status: 'processing', executedAt: null },
+  { $set: { status: 'failed' } }
+);
      // 🔒 prevent same-type duplicate orders (IMPORTANT)
 const activeSameType = await Run.findOne({
   link: run.link,
@@ -970,6 +975,12 @@ setInterval(async () => {
     console.log("[PING] Keeping server alive");
   } catch (e) {}
 }, 5 * 60 * 1000);
+
+app.post("/reset-all", async (req, res) => {
+  await Run.deleteMany({});
+  await Order.deleteMany({});
+  res.json({ success: true });
+});
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`========================================`);
