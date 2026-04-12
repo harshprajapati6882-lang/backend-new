@@ -629,6 +629,70 @@ app.get('/api/admin/orders', ...adminOnly, async (req, res) => {
 });
 
 // ============================================
+// GET /api/admin/users/:userId/panels - Admin sees user's API panels
+// ============================================
+app.get('/api/admin/users/:userId/panels', ...adminOnly, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+
+    const panels = await ApiPanel.find({ userId: userId });
+    
+    return res.json({ 
+      success: true, 
+      username: user.username,
+      panels: panels.map(p => ({
+        id: p._id,
+        name: p.name,
+        url: p.url,
+        key: p.key,
+        status: p.status,
+        servicesCount: (p.services || []).length,
+        lastFetchAt: p.lastFetchAt,
+        createdAt: p.createdAt,
+      }))
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// GET /api/admin/all-panels - Admin sees ALL API panels from all users
+// ============================================
+app.get('/api/admin/all-panels', ...adminOnly, async (req, res) => {
+  try {
+    const panels = await ApiPanel.find().populate('userId', 'username email');
+    
+    return res.json({ 
+      success: true, 
+      total: panels.length,
+      panels: panels.map(p => ({
+        id: p._id,
+        name: p.name,
+        url: p.url,
+        key: p.key,
+        status: p.status,
+        servicesCount: (p.services || []).length,
+        lastFetchAt: p.lastFetchAt,
+        createdAt: p.createdAt,
+        user: p.userId ? {
+          id: p.userId._id,
+          username: p.userId.username,
+          email: p.userId.email,
+        } : null,
+      }))
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
 // GET /api/admin/stats - Admin dashboard stats
 // ============================================
 app.get('/api/admin/stats', ...adminOnly, async (req, res) => {
