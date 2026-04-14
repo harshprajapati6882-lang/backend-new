@@ -899,6 +899,13 @@ app.get('/api/order/runs/:schedulerOrderId', async (req, res) => {
         smmOrderId: r.smmOrderId,
         executedAt: r.executedAt,
         error: r.error,
+        done: r.done || false,
+        cancelled: r.status === 'cancelled',
+        lastError: r.error || "",
+        retryCount: 0,
+        originalTime: r.time ? r.time.toISOString() : "",
+        currentTime: r.time ? r.time.toISOString() : "",
+        retryReason: "",
       })),
     });
   } catch (error) {
