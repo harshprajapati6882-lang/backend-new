@@ -1,22 +1,22 @@
-const express = require('express'); 
+const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const mongoose = require('mongoose');
 mongoose.set('bufferCommands', false);
 
 const app = express();
-const PORT = process.env.PORT || 5000; 
+const PORT = process.env.PORT || 5000;
 
 app.use(cors());
 app.use(express.json());
 
 /* =========================
-   🔥 MONGODB CONNECTION - FIXED
+   🔥 MONGODB CONNECTION
 ========================= */
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://harshprajapati6882_db_user:mbyjv1uPdKtLBz1l@devanush.tqknxqf.mongodb.net/smm-panel?retryWrites=true&w=majority';
 
 mongoose.connect(MONGODB_URI, {
-  serverSelectionTimeoutMS: 30000, // 🔥 increase timeout 
+  serverSelectionTimeoutMS: 30000,
 })
 .then(() => {
   console.log('✅ MongoDB Connected Successfully');
@@ -45,7 +45,14 @@ const RunSchema = new mongoose.Schema({
   executedAt: { type: Date, default: null },
   error: { type: String, default: null },
   comments: { type: String, default: null },
+  // 🔥 NEW: Execution lock to prevent duplicates
+  executionLock: { type: String, default: null },
+  lockedAt: { type: Date, default: null },
 });
+
+// 🔥 COMPOUND INDEX to prevent duplicate queue additions
+RunSchema.index({ status: 1, time: 1 });
+RunSchema.index({ _id: 1, status: 1 }); // For atomic transitions
 
 const OrderSchema = new mongoose.Schema({
   schedulerOrderId: { type: String, required: true, unique: true, index: true },
@@ -68,7 +75,13 @@ const Order = mongoose.model('Order', OrderSchema);
 let MIN_VIEWS_PER_RUN = 100;
 
 /* =========================
-   🔥 4 SEPARATE QUEUES + FLAGS
+   🔥 EXECUTION TRACKING SET (In-Memory Dedup)
+========================= */
+const executingRunIds = new Set();  // Track _id strings currently being executed
+const queuedRunIds = new Set();    // Track _id strings currently in any queue
+
+/* =========================
+   🔥 4 SEPARATE QUEUES
 ========================= */
 let viewsQueue = [];
 let likesQueue = [];
@@ -94,7 +107,6 @@ async function placeOrder({ apiUrl, apiKey, service, link, quantity, comments })
     quantity: String(quantity),
   });
 
-  // 🔥 ADD THIS
   if (comments) {
     params.append('comments', comments);
   }
@@ -105,6 +117,7 @@ async function placeOrder({ apiUrl, apiKey, service, link, quantity, comments })
 
   return response.data;
 }
+
 /* =========================
    ADD RUNS TO DATABASE
 ========================= */
@@ -115,44 +128,30 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
     if (!serviceConfig) continue;
 
     const label = key.toUpperCase();
-    const isViewService = label === 'VIEWS';
 
     for (const run of serviceConfig.runs) {
       let quantity;
 
-// VIEWS
-if (label === 'VIEWS') {
-  if (!run.quantity || run.quantity < 100) continue;
-  quantity = run.quantity;
-}
+      if (label === 'VIEWS') {
+        if (!run.quantity || run.quantity < 100) continue;
+        quantity = run.quantity;
+      } else if (label === 'COMMENTS') {
+        if (!run.comments) continue;
+        let lines = run.comments
+          .split('\n')
+          .map(c => c.trim())
+          .filter(c => c.length > 0);
+        if (lines.length < 5) continue;
+        if (lines.length > 10) {
+          lines = lines.sort(() => Math.random() - 0.5).slice(0, 10);
+        }
+        run.comments = lines.join('\n');
+        quantity = lines.length;
+      } else {
+        if (!run.quantity || run.quantity <= 0) continue;
+        quantity = run.quantity;
+      }
 
-// COMMENTS
-else if (label === 'COMMENTS') {
-  if (!run.comments) continue;
-
-  let lines = run.comments
-    .split('\n')
-    .map(c => c.trim())
-    .filter(c => c.length > 0);
-
-  if (lines.length < 5) continue;
-
-  // 🔥 LIMIT MAX TO 10
-  if (lines.length > 10) {
-  lines = lines.sort(() => Math.random() - 0.5).slice(0, 10);
-}
-
-  // 🔥 UPDATE COMMENTS AFTER TRIM
-  run.comments = lines.join('\n');
-
-  quantity = lines.length;
-}
-
-// OTHERS (likes, shares, saves)
-else {
-  if (!run.quantity || run.quantity <= 0) continue;
-  quantity = run.quantity;
-}
       const runData = new Run({
         id: Date.now() + Math.random(),
         schedulerOrderId,
@@ -170,6 +169,8 @@ else {
         executedAt: null,
         error: null,
         comments: run.comments || null,
+        executionLock: null,
+        lockedAt: null,
       });
 
       await runData.save();
@@ -181,81 +182,94 @@ else {
 }
 
 /* =========================
-   EXECUTE RUN
+   🔥 ATOMIC STATUS TRANSITION
+   This is the KEY fix - uses MongoDB's
+   findOneAndUpdate with status condition
+========================= */
+async function atomicStatusTransition(runId, fromStatus, toStatus, extraFields = {}) {
+  const result = await Run.findOneAndUpdate(
+    {
+      _id: runId,
+      status: fromStatus,  // 🔥 ONLY transitions if status is EXACTLY what we expect
+    },
+    {
+      $set: {
+        status: toStatus,
+        ...extraFields,
+      },
+    },
+    {
+      new: true,  // Return updated document
+    }
+  );
+
+  return result; // null if status was already changed (another process got it first)
+}
+
+/* =========================
+   🔥 EXECUTE RUN (FIXED - No Duplicates)
 ========================= */
 async function executeRun(run) {
-   // 🔥 STOP IF ORDER CANCELLED
-const order = await Order.findOne({ schedulerOrderId: run.schedulerOrderId });
-   if (run.status === 'cancelled') {
-  console.log(`[SKIP] Run already cancelled`);
-  return;
-}
+  const runIdStr = run._id.toString();
 
-if (!order || order.status === 'cancelled') {
-  console.log(`[SKIP] Order cancelled → run skipped`);
-  return;
-}
+  // 🔥 GUARD 1: Check in-memory execution set
+  if (executingRunIds.has(runIdStr)) {
+    console.log(`[SKIP] Run ${runIdStr} already executing (in-memory guard)`);
+    return;
+  }
+
+  // 🔥 GUARD 2: Add to executing set IMMEDIATELY
+  executingRunIds.add(runIdStr);
+
   try {
-     // 🔥 clean stuck runs (IMPORTANT)
-await Run.updateMany(
-  { status: 'processing', executedAt: null },
-  { $set: { status: 'failed' } }
-);
-     // 🔒 prevent same-type duplicate orders (IMPORTANT)
-const activeSameType = await Run.findOne({
-  link: run.link,
-  label: run.label,
-  status: { $in: ['processing'] },
-  schedulerOrderId: run.schedulerOrderId // 🔥 THIS IS THE FIX
-});
+    // 🔥 GUARD 3: Atomic transition from queued → processing
+    // If another process already changed status, this returns null
+    const lockedRun = await atomicStatusTransition(run._id, 'queued', 'processing', {
+      executionLock: `exec-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
+      lockedAt: new Date(),
+    });
 
-if (activeSameType && activeSameType._id.toString() !== run._id.toString()) {
-  console.log(`[${run.label}] Skipping - same type already active for this link`);
-
-  // push back to queue
-  if (run.label === 'VIEWS') viewsQueue.push(run);
-  if (run.label === 'LIKES') likesQueue.push(run);
-  if (run.label === 'SHARES') sharesQueue.push(run);
-  if (run.label === 'SAVES') savesQueue.push(run);
-  if (run.label === 'COMMENTS') commentsQueue.push(run);
-
-  return;
-}
-    if (!run || !run._id) {
-      console.warn(`[${run?.label}] Invalid run, skipping`);
+    if (!lockedRun) {
+      console.log(`[SKIP] Run ${runIdStr} - atomic lock failed (status already changed)`);
       return;
     }
 
-    if (!run.quantity || run.quantity <= 0) return;
+    // 🔥 GUARD 4: Check if order is cancelled
+    const order = await Order.findOne({ schedulerOrderId: lockedRun.schedulerOrderId });
+    if (!order || order.status === 'cancelled' || lockedRun.status === 'cancelled') {
+      console.log(`[SKIP] Order cancelled → run skipped`);
+      await Run.updateOne({ _id: run._id }, { $set: { status: 'cancelled', done: true } });
+      return;
+    }
 
-    console.log(`[${run.label}] Executing run #${run.id}, quantity: ${run.quantity}`);
+    if (!lockedRun.quantity || lockedRun.quantity <= 0) {
+      console.log(`[SKIP] Run has 0 quantity`);
+      await Run.updateOne({ _id: run._id }, { $set: { status: 'failed', error: 'Zero quantity' } });
+      return;
+    }
 
-    // 🔥 SAFE UPDATE (no version conflict)
-    await Run.updateOne(
-      { _id: run._id },
-      { $set: { status: 'processing' } }
-    );
+    console.log(`[${lockedRun.label}] Executing run #${lockedRun.id}, quantity: ${lockedRun.quantity}`);
 
-    await updateOrderStatus(run.schedulerOrderId);
+    await updateOrderStatus(lockedRun.schedulerOrderId);
 
     let payload = {
-  apiUrl: run.apiUrl,
-  apiKey: run.apiKey,
-  service: run.service,
-  link: run.link,
-};
+      apiUrl: lockedRun.apiUrl,
+      apiKey: lockedRun.apiKey,
+      service: lockedRun.service,
+      link: lockedRun.link,
+    };
 
-if (run.label === 'COMMENTS') {
-  payload.comments = run.comments;
-  payload.quantity = run.quantity;
-} else {
-  payload.quantity = run.quantity;
-}
+    if (lockedRun.label === 'COMMENTS') {
+      payload.comments = lockedRun.comments;
+      payload.quantity = lockedRun.quantity;
+    } else {
+      payload.quantity = lockedRun.quantity;
+    }
 
-const result = await placeOrder(payload);
+    const result = await placeOrder(payload);
 
     if (result?.order) {
-      console.log(`[${run.label}] SUCCESS - SMM Order ID: ${result.order}`);
+      console.log(`[${lockedRun.label}] SUCCESS - SMM Order ID: ${result.order}`);
 
       await Run.updateOne(
         { _id: run._id },
@@ -268,16 +282,15 @@ const result = await placeOrder(payload);
           }
         }
       );
-
     } else {
-      console.error(`[${run.label}] FAILED`, result);
+      console.error(`[${lockedRun.label}] FAILED`, result);
 
       await Run.updateOne(
         { _id: run._id },
         {
           $set: {
             status: 'failed',
-            error: result?.error || 'Unknown error'
+            error: result?.error || 'Unknown error',
           }
         }
       );
@@ -292,14 +305,17 @@ const result = await placeOrder(payload);
         {
           $set: {
             status: 'failed',
-            error: err.response?.data?.error || err.message
+            error: err.response?.data?.error || err.message,
           }
         }
       );
     }
+  } finally {
+    // 🔥 ALWAYS remove from tracking sets
+    executingRunIds.delete(runIdStr);
+    queuedRunIds.delete(runIdStr);
+    await updateOrderStatus(run.schedulerOrderId);
   }
-
-  await updateOrderStatus(run.schedulerOrderId);
 }
 
 /* =========================
@@ -319,274 +335,190 @@ async function updateOrderStatus(schedulerOrderId) {
   const processingRuns = orderRuns.filter(r => r.status === 'processing').length;
   const queuedRuns = orderRuns.filter(r => r.status === 'queued').length;
 
+  let newStatus;
   if (completedRuns === totalRuns) {
-    order.status = 'completed';
+    newStatus = 'completed';
   } else if (failedRuns === totalRuns) {
-    order.status = 'failed';
+    newStatus = 'failed';
   } else if (processingRuns > 0 || completedRuns > 0 || queuedRuns > 0) {
-    order.status = 'running';
+    newStatus = 'running';
   } else {
-    order.status = 'pending';
+    newStatus = 'pending';
   }
-
-  order.completedRuns = completedRuns;
-  order.totalRuns = totalRuns;
-  order.lastUpdatedAt = new Date();
-  order.runStatuses = orderRuns.map(r => r.status);
 
   await Order.updateOne(
-  { schedulerOrderId },
-  {
-    $set: {
-      status: order.status,
-      completedRuns: order.completedRuns,
-      totalRuns: order.totalRuns,
-      lastUpdatedAt: new Date(),
-      runStatuses: order.runStatuses
+    { schedulerOrderId },
+    {
+      $set: {
+        status: newStatus,
+        completedRuns: completedRuns,
+        totalRuns: totalRuns,
+        lastUpdatedAt: new Date(),
+        runStatuses: orderRuns.map(r => r.status),
+      }
     }
-  }
-);
+  );
 }
 
 /* =========================
-   🔥 QUEUE PROCESSORS
+   🔥 QUEUE PROCESSORS (FIXED)
 ========================= */
-async function processViewsQueue() {
-  if (isExecutingViews || viewsQueue.length === 0) return;
+async function processQueue(queueName, queue, isExecutingFlag, setExecutingFlag) {
+  if (isExecutingFlag() || queue.length === 0) return;
 
-  isExecutingViews = true;
-  const run = viewsQueue.shift();
+  setExecutingFlag(true);
+  const run = queue.shift();
+  const runIdStr = run._id.toString();
 
-  console.log(`[VIEWS QUEUE] Processing run #${run.id}, Remaining: ${viewsQueue.length}`);
+  console.log(`[${queueName} QUEUE] Processing, Remaining: ${queue.length}`);
 
   try {
+    // 🔥 Re-fetch from DB to get latest status
     const freshRun = await Run.findById(run._id);
 
-    if (!freshRun || freshRun.status === 'cancelled') {
-      console.log(`[VIEWS QUEUE] Skipped cancelled run`);
+    if (!freshRun) {
+      console.log(`[${queueName} QUEUE] Run not found in DB, skipping`);
+    } else if (freshRun.status === 'cancelled' || freshRun.status === 'completed' || freshRun.status === 'failed') {
+      console.log(`[${queueName} QUEUE] Run already ${freshRun.status}, skipping`);
+    } else if (freshRun.status === 'processing') {
+      console.log(`[${queueName} QUEUE] Run already processing, skipping`);
     } else {
       await executeRun(freshRun);
     }
-
   } catch (err) {
-    console.error(`[VIEWS QUEUE] Error:`, err);
+    console.error(`[${queueName} QUEUE] Error:`, err);
+  } finally {
+    // 🔥 Remove from queued tracking
+    queuedRunIds.delete(runIdStr);
   }
 
-  isExecutingViews = false;
+  setExecutingFlag(false);
   await new Promise(resolve => setTimeout(resolve, 8000));
 
-  if (viewsQueue.length > 0) {
-    setImmediate(() => processViewsQueue());
+  if (queue.length > 0) {
+    setImmediate(() => processQueue(queueName, queue, isExecutingFlag, setExecutingFlag));
   }
 }
 
-async function processLikesQueue() {
-  if (isExecutingLikes || likesQueue.length === 0) return;
-
-  isExecutingLikes = true;
-  const run = likesQueue.shift();
-
-  console.log(`[LIKES QUEUE] Processing run #${run.id}, Remaining: ${likesQueue.length}`);
-
-  try {
-    const freshRun = await Run.findById(run._id);
-
-    if (!freshRun || freshRun.status === 'cancelled') {
-      console.log(`[LIKES QUEUE] Skipped cancelled run`);
-    } else {
-      await executeRun(freshRun);
-    }
-
-  } catch (err) {
-    console.error(`[LIKES QUEUE] Error:`, err);
-  }
-
-  isExecutingLikes = false;
-  await new Promise(resolve => setTimeout(resolve, 8000));
-
-  if (likesQueue.length > 0) {
-    setImmediate(() => processLikesQueue());
-  }
+// 🔥 Simplified queue processors using shared function
+function processViewsQueue() {
+  processQueue('VIEWS', viewsQueue, () => isExecutingViews, (v) => { isExecutingViews = v; });
+}
+function processLikesQueue() {
+  processQueue('LIKES', likesQueue, () => isExecutingLikes, (v) => { isExecutingLikes = v; });
+}
+function processSharesQueue() {
+  processQueue('SHARES', sharesQueue, () => isExecutingShares, (v) => { isExecutingShares = v; });
+}
+function processSavesQueue() {
+  processQueue('SAVES', savesQueue, () => isExecutingSaves, (v) => { isExecutingSaves = v; });
+}
+function processCommentsQueue() {
+  processQueue('COMMENTS', commentsQueue, () => isExecutingComments, (v) => { isExecutingComments = v; });
 }
 
-async function processSharesQueue() {
-  if (isExecutingShares || sharesQueue.length === 0) return;
-
-  isExecutingShares = true;
-  const run = sharesQueue.shift();
-
-  console.log(`[SHARES QUEUE] Processing run #${run.id}, Remaining: ${sharesQueue.length}`);
-
-  try {
-    const freshRun = await Run.findById(run._id);
-
-    if (!freshRun || freshRun.status === 'cancelled') {
-      console.log(`[SHARES QUEUE] Skipped cancelled run`);
-    } else {
-      await executeRun(freshRun);
-    }
-
-  } catch (err) {
-    console.error(`[SHARES QUEUE] Error:`, err);
-  }
-
-  isExecutingShares = false;
-  await new Promise(resolve => setTimeout(resolve, 8000));
-
-  if (sharesQueue.length > 0) {
-    setImmediate(() => processSharesQueue());
-  }
-}
-
-async function processSavesQueue() {
-  if (isExecutingSaves || savesQueue.length === 0) return;
-
-  isExecutingSaves = true;
-  const run = savesQueue.shift();
-
-  console.log(`[SAVES QUEUE] Processing run #${run.id}, Remaining: ${savesQueue.length}`);
-
-  try {
-    const freshRun = await Run.findById(run._id);
-
-    if (!freshRun || freshRun.status === 'cancelled') {
-      console.log(`[SAVES QUEUE] Skipped cancelled run`);
-    } else {
-      await executeRun(freshRun);
-    }
-
-  } catch (err) {
-    console.error(`[SAVES QUEUE] Error:`, err);
-  }
-
-  isExecutingSaves = false;
-  await new Promise(resolve => setTimeout(resolve, 8000));
-
-  if (savesQueue.length > 0) {
-    setImmediate(() => processSavesQueue());
-  }
-}
-
-async function processCommentsQueue() {
-  if (isExecutingComments || commentsQueue.length === 0) return;
-
-  isExecutingComments = true;
-  const run = commentsQueue.shift();
-
-  console.log(`[COMMENTS QUEUE] Processing run #${run.id}, Remaining: ${commentsQueue.length}`);
-
-  try {
-    const freshRun = await Run.findById(run._id);
-
-    if (!freshRun || freshRun.status === 'cancelled') {
-      console.log(`[COMMENTS QUEUE] Skipped cancelled run`);
-    } else {
-      await executeRun(freshRun);
-    }
-
-  } catch (err) {
-    console.error(`[COMMENTS QUEUE] Error:`, err);
-  }
-
-  isExecutingComments = false;
-  await new Promise(resolve => setTimeout(resolve, 8000));
-
-  if (commentsQueue.length > 0) {
-    setImmediate(() => processCommentsQueue());
-  }
-}
 /* =========================
-   CHECK IF RUN IN QUEUE
+   🔥 SAFE QUEUE ADDITION (Atomic)
 ========================= */
-function isRunInQueue(runId) {
-  return viewsQueue.some(r => r.id === runId) ||
-         likesQueue.some(r => r.id === runId) ||
-         sharesQueue.some(r => r.id === runId) ||
-         savesQueue.some(r => r.id === runId) ||
-         commentsQueue.some(r => r.id === runId);
+async function safeAddToQueue(run) {
+  const runIdStr = run._id.toString();
+
+  // 🔥 CHECK 1: Already in queue or executing?
+  if (queuedRunIds.has(runIdStr) || executingRunIds.has(runIdStr)) {
+    return false;
+  }
+
+  // 🔥 CHECK 2: Atomic transition pending → queued
+  const updated = await atomicStatusTransition(run._id, 'pending', 'queued');
+
+  if (!updated) {
+    // Another scheduler tick already grabbed this run
+    return false;
+  }
+
+  // 🔥 CHECK 3: Verify order isn't cancelled
+  const order = await Order.findOne({ schedulerOrderId: updated.schedulerOrderId });
+  if (!order || order.status === 'cancelled') {
+    await Run.updateOne({ _id: run._id }, { $set: { status: 'cancelled', done: true } });
+    return false;
+  }
+
+  // 🔥 Add to tracking set and queue
+  queuedRunIds.add(runIdStr);
+
+  if (updated.label === 'VIEWS') viewsQueue.push(updated);
+  else if (updated.label === 'LIKES') likesQueue.push(updated);
+  else if (updated.label === 'SHARES') sharesQueue.push(updated);
+  else if (updated.label === 'SAVES') savesQueue.push(updated);
+  else if (updated.label === 'COMMENTS') commentsQueue.push(updated);
+
+  console.log(`[SCHEDULER] Added ${updated.label} run to queue (qty: ${updated.quantity})`);
+  return true;
 }
 
 /* =========================
-   🔥 MAIN SCHEDULER
+   🔥 MAIN SCHEDULER (FIXED)
 ========================= */
 mongoose.connection.once('open', () => {
   console.log("🚀 Scheduler started after DB connected");
 
+  // 🔥 STARTUP: Clean up stuck runs from previous server instance
+  (async () => {
+    try {
+      const stuckProcessing = await Run.updateMany(
+        { status: 'processing', executedAt: null },
+        { $set: { status: 'pending', executionLock: null, lockedAt: null } }
+      );
+      const stuckQueued = await Run.updateMany(
+        { status: 'queued' },
+        { $set: { status: 'pending', executionLock: null, lockedAt: null } }
+      );
+      console.log(`[STARTUP] Reset ${stuckProcessing.modifiedCount} stuck processing runs`);
+      console.log(`[STARTUP] Reset ${stuckQueued.modifiedCount} stuck queued runs`);
+    } catch (err) {
+      console.error('[STARTUP] Error cleaning stuck runs:', err);
+    }
+  })();
+
   setInterval(async () => {
-  try {
-    const now = Date.now();
-    let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0 };
+    try {
+      const now = new Date();
+      let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0 };
 
-    const allRuns = await Run.find({
-  status: { $nin: ['completed', 'failed', 'cancelled', 'processing', 'queued'] }
-});
+      // 🔥 ONLY fetch pending runs whose time has passed
+      const pendingRuns = await Run.find({
+        status: 'pending',
+        time: { $lte: now },
+      });
 
-    for (let run of allRuns) {
-      if (
-  run.status === 'queued' ||
-  run.status === 'processing' ||
-  run.status === 'completed' ||
-  isRunInQueue(run.id)
-) continue;
-      const order = await Order.findOne({ schedulerOrderId: run.schedulerOrderId });
+      for (const run of pendingRuns) {
+        const added = await safeAddToQueue(run);
 
-if (!order || order.status === 'cancelled') {
-  continue; // 🔥 DO NOT ADD TO QUEUE
-}
-
-      const runTime = new Date(run.time).getTime();
-
-      if (runTime <= now && run.status === 'pending') {
-        
-        if (run.label === 'VIEWS') {
-          run.status = 'queued';
-          await run.save();
-          viewsQueue.push(run);
-          addedToQueue.views++;
-          console.log(`[SCHEDULER] Added VIEWS run #${run.id} to queue (qty: ${run.quantity})`);
-        } 
-        else if (run.label === 'LIKES') {
-          run.status = 'queued';
-          await run.save();
-          likesQueue.push(run);
-          addedToQueue.likes++;
-          console.log(`[SCHEDULER] Added LIKES run #${run.id} to queue (qty: ${run.quantity})`);
-        } 
-        else if (run.label === 'SHARES') {
-          run.status = 'queued';
-          await run.save();
-          sharesQueue.push(run);
-          addedToQueue.shares++;
-          console.log(`[SCHEDULER] Added SHARES run #${run.id} to queue (qty: ${run.quantity})`);
-        } 
-        else if (run.label === 'SAVES') {
-          run.status = 'queued';
-          await run.save();
-          savesQueue.push(run);
-          addedToQueue.saves++;
-          console.log(`[SCHEDULER] Added SAVES run #${run.id} to queue (qty: ${run.quantity})`);
+        if (added) {
+          const label = run.label.toLowerCase();
+          if (label === 'views') addedToQueue.views++;
+          else if (label === 'likes') addedToQueue.likes++;
+          else if (label === 'shares') addedToQueue.shares++;
+          else if (label === 'saves') addedToQueue.saves++;
+          else if (label === 'comments') addedToQueue.comments++;
         }
-        else if (run.label === 'COMMENTS') {
-           run.status = 'queued';
-           await run.save();
-           commentsQueue.push(run);
-           addedToQueue.comments++;
       }
+
+      const totalAdded = addedToQueue.views + addedToQueue.likes + addedToQueue.shares + addedToQueue.saves + addedToQueue.comments;
+      if (totalAdded > 0) {
+        console.log(`[SCHEDULER] Added to queues - Views: ${addedToQueue.views}, Likes: ${addedToQueue.likes}, Shares: ${addedToQueue.shares}, Saves: ${addedToQueue.saves}, Comments: ${addedToQueue.comments}`);
       }
-    }
 
-    if (addedToQueue.views + addedToQueue.likes + addedToQueue.shares + addedToQueue.saves > 0) {
-      console.log(`[SCHEDULER] Added to queues - Views: ${addedToQueue.views}, Likes: ${addedToQueue.likes}, Shares: ${addedToQueue.shares}, Saves: ${addedToQueue.saves}, Comments: ${addedToQueue.comments}`);
-    }
+      // 🔥 Start processors if needed
+      if (viewsQueue.length > 0 && !isExecutingViews) processViewsQueue();
+      if (likesQueue.length > 0 && !isExecutingLikes) processLikesQueue();
+      if (sharesQueue.length > 0 && !isExecutingShares) processSharesQueue();
+      if (savesQueue.length > 0 && !isExecutingSaves) processSavesQueue();
+      if (commentsQueue.length > 0 && !isExecutingComments) processCommentsQueue();
 
-    if (viewsQueue.length > 0 && !isExecutingViews) processViewsQueue();
-    if (likesQueue.length > 0 && !isExecutingLikes) processLikesQueue();
-    if (sharesQueue.length > 0 && !isExecutingShares) processSharesQueue();
-    if (savesQueue.length > 0 && !isExecutingSaves) processSavesQueue();
-    if (commentsQueue.length > 0 && !isExecutingComments) processCommentsQueue();
-  } catch (error) {
-    console.error('[SCHEDULER] Error:', error);
-  }
+    } catch (error) {
+      console.error('[SCHEDULER] Error:', error);
+    }
   }, 10000);
 });
 
@@ -736,68 +668,96 @@ app.post('/api/order/control', async (req, res) => {
     }
 
     if (action === 'cancel') {
-      for (let run of orderRuns) {
-        if (run.status === 'pending' || run.status === 'processing' || run.status === 'queued') {
-          run.status = 'cancelled';
-          run.done = true;
-          await run.save();
-          
-          viewsQueue = viewsQueue.filter(r => r.id !== run.id);
-          likesQueue = likesQueue.filter(r => r.id !== run.id);
-          sharesQueue = sharesQueue.filter(r => r.id !== run.id);
-          savesQueue = savesQueue.filter(r => r.id !== run.id);
-          commentsQueue = commentsQueue.filter(r => r.id !== run.id);
-        }
-      }
-      order.status = 'cancelled';
-      await order.save();
+      // 🔥 Bulk update all cancellable runs
+      await Run.updateMany(
+        {
+          schedulerOrderId,
+          status: { $in: ['pending', 'processing', 'queued'] }
+        },
+        { $set: { status: 'cancelled', done: true } }
+      );
 
+      // 🔥 Remove from in-memory queues
+      const orderRunIds = new Set(orderRuns.map(r => r._id.toString()));
+      viewsQueue = viewsQueue.filter(r => !orderRunIds.has(r._id.toString()));
+      likesQueue = likesQueue.filter(r => !orderRunIds.has(r._id.toString()));
+      sharesQueue = sharesQueue.filter(r => !orderRunIds.has(r._id.toString()));
+      savesQueue = savesQueue.filter(r => !orderRunIds.has(r._id.toString()));
+      commentsQueue = commentsQueue.filter(r => !orderRunIds.has(r._id.toString()));
+
+      // 🔥 Remove from tracking sets
+      orderRunIds.forEach(id => {
+        queuedRunIds.delete(id);
+        // Note: executingRunIds will be cleaned up when execution finishes
+      });
+
+      await Order.updateOne(
+        { schedulerOrderId },
+        { $set: { status: 'cancelled', lastUpdatedAt: new Date() } }
+      );
+
+      const updatedRuns = await Run.find({ schedulerOrderId });
       return res.json({
         success: true,
         status: 'cancelled',
-        completedRuns: orderRuns.filter(r => r.status === 'completed').length,
-        runStatuses: orderRuns.map(r => r.status),
+        completedRuns: updatedRuns.filter(r => r.status === 'completed').length,
+        runStatuses: updatedRuns.map(r => r.status),
       });
     }
 
     if (action === 'pause') {
-      for (let run of orderRuns) {
-        if (run.status === 'pending' || run.status === 'queued') {
-          run.status = 'paused';
-          await run.save();
-          
-          viewsQueue = viewsQueue.filter(r => r.id !== run.id);
-          likesQueue = likesQueue.filter(r => r.id !== run.id);
-          sharesQueue = sharesQueue.filter(r => r.id !== run.id);
-          savesQueue = savesQueue.filter(r => r.id !== run.id);
-        }
-      }
-      order.status = 'paused';
-      await order.save();
+      await Run.updateMany(
+        {
+          schedulerOrderId,
+          status: { $in: ['pending', 'queued'] }
+        },
+        { $set: { status: 'paused' } }
+      );
 
+      // Remove from queues
+      const orderRunIds = new Set(orderRuns.map(r => r._id.toString()));
+      viewsQueue = viewsQueue.filter(r => !orderRunIds.has(r._id.toString()));
+      likesQueue = likesQueue.filter(r => !orderRunIds.has(r._id.toString()));
+      sharesQueue = sharesQueue.filter(r => !orderRunIds.has(r._id.toString()));
+      savesQueue = savesQueue.filter(r => !orderRunIds.has(r._id.toString()));
+      commentsQueue = commentsQueue.filter(r => !orderRunIds.has(r._id.toString()));
+
+      orderRunIds.forEach(id => queuedRunIds.delete(id));
+
+      await Order.updateOne(
+        { schedulerOrderId },
+        { $set: { status: 'paused', lastUpdatedAt: new Date() } }
+      );
+
+      const updatedRuns = await Run.find({ schedulerOrderId });
       return res.json({
         success: true,
         status: 'paused',
-        completedRuns: orderRuns.filter(r => r.status === 'completed').length,
-        runStatuses: orderRuns.map(r => r.status),
+        completedRuns: updatedRuns.filter(r => r.status === 'completed').length,
+        runStatuses: updatedRuns.map(r => r.status),
       });
     }
 
     if (action === 'resume') {
-      for (let run of orderRuns) {
-        if (run.status === 'paused') {
-          run.status = 'pending';
-          await run.save();
-        }
-      }
-      order.status = 'running';
-      await order.save();
+      await Run.updateMany(
+        {
+          schedulerOrderId,
+          status: 'paused'
+        },
+        { $set: { status: 'pending' } }
+      );
 
+      await Order.updateOne(
+        { schedulerOrderId },
+        { $set: { status: 'running', lastUpdatedAt: new Date() } }
+      );
+
+      const updatedRuns = await Run.find({ schedulerOrderId });
       return res.json({
         success: true,
         status: 'running',
-        completedRuns: orderRuns.filter(r => r.status === 'completed').length,
-        runStatuses: orderRuns.map(r => r.status),
+        completedRuns: updatedRuns.filter(r => r.status === 'completed').length,
+        runStatuses: updatedRuns.map(r => r.status),
       });
     }
 
@@ -861,45 +821,46 @@ app.get('/api/queues/status', (req, res) => {
       pending: sharesQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
     },
     saves: {
-  queueLength: savesQueue.length,
-  isExecuting: isExecutingSaves,
-  pending: savesQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
-},
-comments: {
-  queueLength: commentsQueue.length,
-  isExecuting: isExecutingComments,
-  pending: commentsQueue.map(r => ({
-    id: r.id,
-    quantity: r.quantity,
-    time: r.time
-  }))
-}
+      queueLength: savesQueue.length,
+      isExecuting: isExecutingSaves,
+      pending: savesQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
+    },
+    comments: {
+      queueLength: commentsQueue.length,
+      isExecuting: isExecutingComments,
+      pending: commentsQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
+    },
+    // 🔥 NEW: Debug info
+    tracking: {
+      executingCount: executingRunIds.size,
+      queuedCount: queuedRunIds.size,
+    }
   });
 });
 
 app.post('/api/runs/retry-stuck', async (req, res) => {
   try {
-    const now = Date.now();
-    let resetCount = 0;
+    // 🔥 Reset stuck processing runs (no executedAt = never actually executed)
+    const stuckProcessing = await Run.updateMany(
+      { status: 'processing', executedAt: null, lockedAt: { $lt: new Date(Date.now() - 120000) } },
+      { $set: { status: 'pending', executionLock: null, lockedAt: null } }
+    );
 
-    const allRuns = await Run.find({ done: false });
+    // 🔥 Reset orphaned queued runs
+    const stuckQueued = await Run.updateMany(
+      { status: 'queued' },
+      { $set: { status: 'pending', executionLock: null, lockedAt: null } }
+    );
 
-    for (let run of allRuns) {
-      const runTime = new Date(run.time).getTime();
-      if (runTime <= now && run.status === 'pending') {
-        resetCount++;
-      }
-      if (run.status === 'queued' && !isRunInQueue(run.id)) {
-        run.status = 'pending';
-        await run.save();
-        resetCount++;
-      }
-    }
+    // 🔥 Clear tracking sets
+    queuedRunIds.clear();
+    executingRunIds.clear();
 
     return res.json({
       success: true,
-      resetCount,
-      message: `Reset ${resetCount} stuck runs`
+      resetProcessing: stuckProcessing.modifiedCount,
+      resetQueued: stuckQueued.modifiedCount,
+      message: `Reset ${stuckProcessing.modifiedCount + stuckQueued.modifiedCount} stuck runs`,
     });
   } catch (error) {
     return res.status(500).json({ error: error.message });
@@ -908,45 +869,23 @@ app.post('/api/runs/retry-stuck', async (req, res) => {
 
 app.post('/api/scheduler/trigger', async (req, res) => {
   try {
-    const now = Date.now();
+    const now = new Date();
     let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0 };
 
-    const allRuns = await Run.find({ 
-      done: false,
-      status: { $nin: ['completed', 'failed', 'cancelled', 'processing', 'queued'] }
+    const pendingRuns = await Run.find({
+      status: 'pending',
+      time: { $lte: now },
     });
 
-    for (let run of allRuns) {
-      if (isRunInQueue(run.id)) continue;
-      const runTime = new Date(run.time).getTime();
-
-      if (runTime <= now && run.status === 'pending') {
-        if (run.label === 'VIEWS') {
-          viewsQueue.push(run);
-          run.status = 'queued';
-          await run.save();
-          addedToQueue.views++;
-        } else if (run.label === 'LIKES') {
-          likesQueue.push(run);
-          run.status = 'queued';
-          await run.save();
-          addedToQueue.likes++;
-        } else if (run.label === 'SHARES') {
-          sharesQueue.push(run);
-          run.status = 'queued';
-          await run.save();
-          addedToQueue.shares++;
-        } else if (run.label === 'SAVES') {
-          savesQueue.push(run);
-          run.status = 'queued';
-          await run.save();
-          addedToQueue.saves++;
-        } else if (run.label === 'COMMENTS') {
-  commentsQueue.push(run);
-  run.status = 'queued';
-  await run.save();
-  addedToQueue.comments++;
-}
+    for (const run of pendingRuns) {
+      const added = await safeAddToQueue(run);
+      if (added) {
+        const label = run.label.toLowerCase();
+        if (label === 'views') addedToQueue.views++;
+        else if (label === 'likes') addedToQueue.likes++;
+        else if (label === 'shares') addedToQueue.shares++;
+        else if (label === 'saves') addedToQueue.saves++;
+        else if (label === 'comments') addedToQueue.comments++;
       }
     }
 
@@ -963,7 +902,8 @@ app.post('/api/scheduler/trigger', async (req, res) => {
         views: viewsQueue.length,
         likes: likesQueue.length,
         shares: sharesQueue.length,
-        saves: savesQueue.length
+        saves: savesQueue.length,
+        comments: commentsQueue.length,
       }
     });
   } catch (error) {
@@ -985,7 +925,8 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`========================================`);
   console.log(`Server running on port ${PORT}`);
   console.log(`Minimum views per run: ${MIN_VIEWS_PER_RUN}`);
-  console.log(`4 Queue system initialized: VIEWS | LIKES | SHARES | SAVES`);
+  console.log(`5 Queue system: VIEWS | LIKES | SHARES | SAVES | COMMENTS`);
   console.log(`Scheduler runs every 10 seconds`);
+  console.log(`🔒 Atomic execution locks ENABLED`);
   console.log(`========================================`);
 });
