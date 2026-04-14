@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const mongoose = require('mongoose');
+const crypto = require('crypto');
 mongoose.set('bufferCommands', false);
 
 const app = express();
@@ -45,14 +46,17 @@ const RunSchema = new mongoose.Schema({
   executedAt: { type: Date, default: null },
   error: { type: String, default: null },
   comments: { type: String, default: null },
-  // 🔥 NEW: Execution lock to prevent duplicates
+  // 🔥 Execution lock fields
   executionLock: { type: String, default: null },
   lockedAt: { type: Date, default: null },
+  // 🔥 NEW: Track which scheduler tick claimed this run
+  claimedByTick: { type: String, default: null },
 });
 
-// 🔥 COMPOUND INDEX to prevent duplicate queue additions
+// 🔥 COMPOUND INDEXES for atomic operations
 RunSchema.index({ status: 1, time: 1 });
-RunSchema.index({ _id: 1, status: 1 }); // For atomic transitions
+RunSchema.index({ _id: 1, status: 1 });
+RunSchema.index({ schedulerOrderId: 1, status: 1 });
 
 const OrderSchema = new mongoose.Schema({
   schedulerOrderId: { type: String, required: true, unique: true, index: true },
@@ -75,13 +79,16 @@ const Order = mongoose.model('Order', OrderSchema);
 let MIN_VIEWS_PER_RUN = 100;
 
 /* =========================
-   🔥 EXECUTION TRACKING SET (In-Memory Dedup)
+   🔥 FIX 1: SCHEDULER LOCK
+   Prevents concurrent scheduler ticks
 ========================= */
-const executingRunIds = new Set();  // Track _id strings currently being executed
-const queuedRunIds = new Set();    // Track _id strings currently in any queue
+let isSchedulerRunning = false;
+let schedulerTickId = 0;
 
 /* =========================
-   🔥 4 SEPARATE QUEUES
+   🔥 FIX 2: PROPER QUEUE SYSTEM
+   Each queue tracks items by MongoDB _id
+   No in-memory dedup sets needed — MongoDB is the source of truth
 ========================= */
 let viewsQueue = [];
 let likesQueue = [];
@@ -113,6 +120,7 @@ async function placeOrder({ apiUrl, apiKey, service, link, quantity, comments })
 
   const response = await axios.post(apiUrl, params.toString(), {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    timeout: 30000, // 🔥 NEW: 30 second timeout
   });
 
   return response.data;
@@ -171,6 +179,7 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
         comments: run.comments || null,
         executionLock: null,
         lockedAt: null,
+        claimedByTick: null,
       });
 
       await runData.save();
@@ -182,75 +191,104 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
 }
 
 /* =========================
-   🔥 ATOMIC STATUS TRANSITION
-   This is the KEY fix - uses MongoDB's
-   findOneAndUpdate with status condition
+   🔥 FIX 3: TRULY ATOMIC CLAIM
+   Uses MongoDB findOneAndUpdate with ALL conditions
+   Returns null if ANY other process already claimed it
 ========================= */
-async function atomicStatusTransition(runId, fromStatus, toStatus, extraFields = {}) {
+async function atomicClaimRun(runId, tickId) {
   const result = await Run.findOneAndUpdate(
     {
       _id: runId,
-      status: fromStatus,  // 🔥 ONLY transitions if status is EXACTLY what we expect
+      status: 'pending',           // 🔥 MUST be pending
+      executionLock: null,         // 🔥 MUST NOT be locked by anyone
+      claimedByTick: null,         // 🔥 MUST NOT be claimed by any tick
     },
     {
       $set: {
-        status: toStatus,
-        ...extraFields,
+        status: 'queued',
+        claimedByTick: tickId,
+        executionLock: `claim-${tickId}`,
+        lockedAt: new Date(),
       },
     },
     {
-      new: true,  // Return updated document
+      new: true,
     }
   );
 
-  return result; // null if status was already changed (another process got it first)
+  return result; // null = someone else got it first
 }
 
 /* =========================
-   🔥 EXECUTE RUN (FIXED - No Duplicates)
+   🔥 FIX 4: ATOMIC EXECUTE LOCK
+   Transitions from queued → processing
+   Only succeeds if still in queued state with matching tick
 ========================= */
-async function executeRun(run) {
+async function atomicExecuteLock(runId, tickId) {
+  const lockId = `exec-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  
+  const result = await Run.findOneAndUpdate(
+    {
+      _id: runId,
+      status: 'queued',              // 🔥 MUST be queued
+      claimedByTick: tickId,         // 🔥 MUST be claimed by this tick
+    },
+    {
+      $set: {
+        status: 'processing',
+        executionLock: lockId,
+        lockedAt: new Date(),
+      },
+    },
+    {
+      new: true,
+    }
+  );
+
+  return result;
+}
+
+/* =========================
+   🔥 FIX 5: EXECUTE RUN (BULLETPROOF)
+   - No in-memory dedup needed
+   - MongoDB is the ONLY source of truth
+   - Each state transition is atomic
+========================= */
+async function executeRun(run, tickId) {
   const runIdStr = run._id.toString();
 
-  // 🔥 GUARD 1: Check in-memory execution set
-  if (executingRunIds.has(runIdStr)) {
-    console.log(`[SKIP] Run ${runIdStr} already executing (in-memory guard)`);
-    return;
-  }
-
-  // 🔥 GUARD 2: Add to executing set IMMEDIATELY
-  executingRunIds.add(runIdStr);
-
   try {
-    // 🔥 GUARD 3: Atomic transition from queued → processing
-    // If another process already changed status, this returns null
-    const lockedRun = await atomicStatusTransition(run._id, 'queued', 'processing', {
-      executionLock: `exec-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
-      lockedAt: new Date(),
-    });
+    // 🔥 STEP 1: Atomic lock from queued → processing
+    const lockedRun = await atomicExecuteLock(run._id, tickId);
 
     if (!lockedRun) {
-      console.log(`[SKIP] Run ${runIdStr} - atomic lock failed (status already changed)`);
+      console.log(`[SKIP] Run ${runIdStr} - could not acquire execute lock (already processed by another worker)`);
       return;
     }
 
-    // 🔥 GUARD 4: Check if order is cancelled
+    // 🔥 STEP 2: Check if order is cancelled
     const order = await Order.findOne({ schedulerOrderId: lockedRun.schedulerOrderId });
-    if (!order || order.status === 'cancelled' || lockedRun.status === 'cancelled') {
+    if (!order || order.status === 'cancelled') {
       console.log(`[SKIP] Order cancelled → run skipped`);
-      await Run.updateOne({ _id: run._id }, { $set: { status: 'cancelled', done: true } });
+      await Run.updateOne(
+        { _id: run._id, status: 'processing' },
+        { $set: { status: 'cancelled', done: true } }
+      );
+      await updateOrderStatus(lockedRun.schedulerOrderId);
       return;
     }
 
     if (!lockedRun.quantity || lockedRun.quantity <= 0) {
       console.log(`[SKIP] Run has 0 quantity`);
-      await Run.updateOne({ _id: run._id }, { $set: { status: 'failed', error: 'Zero quantity' } });
+      await Run.updateOne(
+        { _id: run._id, status: 'processing' },
+        { $set: { status: 'failed', error: 'Zero quantity', done: true } }
+      );
+      await updateOrderStatus(lockedRun.schedulerOrderId);
       return;
     }
 
     console.log(`[${lockedRun.label}] Executing run #${lockedRun.id}, quantity: ${lockedRun.quantity}`);
-
-    await updateOrderStatus(lockedRun.schedulerOrderId);
 
     let payload = {
       apiUrl: lockedRun.apiUrl,
@@ -271,8 +309,9 @@ async function executeRun(run) {
     if (result?.order) {
       console.log(`[${lockedRun.label}] SUCCESS - SMM Order ID: ${result.order}`);
 
-      await Run.updateOne(
-        { _id: run._id },
+      // 🔥 STEP 3: Atomic completion — only if still processing
+      const completed = await Run.findOneAndUpdate(
+        { _id: run._id, status: 'processing' },
         {
           $set: {
             done: true,
@@ -280,17 +319,23 @@ async function executeRun(run) {
             smmOrderId: result.order,
             executedAt: new Date(),
           }
-        }
+        },
+        { new: true }
       );
+
+      if (!completed) {
+        console.warn(`[${lockedRun.label}] WARNING: Run completed but status update failed (may have been cancelled)`);
+      }
     } else {
       console.error(`[${lockedRun.label}] FAILED`, result);
 
-      await Run.updateOne(
-        { _id: run._id },
+      await Run.findOneAndUpdate(
+        { _id: run._id, status: 'processing' },
         {
           $set: {
             status: 'failed',
             error: result?.error || 'Unknown error',
+            done: true,
           }
         }
       );
@@ -299,21 +344,20 @@ async function executeRun(run) {
   } catch (err) {
     console.error(`[${run.label}] ERROR`, err.response?.data || err.message);
 
+    // 🔥 Only update if still in processing state
     if (run?._id) {
-      await Run.updateOne(
-        { _id: run._id },
+      await Run.findOneAndUpdate(
+        { _id: run._id, status: 'processing' },
         {
           $set: {
             status: 'failed',
             error: err.response?.data?.error || err.message,
+            done: true,
           }
         }
       );
     }
   } finally {
-    // 🔥 ALWAYS remove from tracking sets
-    executingRunIds.delete(runIdStr);
-    queuedRunIds.delete(runIdStr);
     await updateOrderStatus(run.schedulerOrderId);
   }
 }
@@ -324,83 +368,115 @@ async function executeRun(run) {
 async function updateOrderStatus(schedulerOrderId) {
   if (!schedulerOrderId) return;
 
-  const orderRuns = await Run.find({ schedulerOrderId });
-  const order = await Order.findOne({ schedulerOrderId });
+  try {
+    const orderRuns = await Run.find({ schedulerOrderId });
+    const order = await Order.findOne({ schedulerOrderId });
 
-  if (!order) return;
+    if (!order) return;
 
-  const totalRuns = orderRuns.length;
-  const completedRuns = orderRuns.filter(r => r.status === 'completed').length;
-  const failedRuns = orderRuns.filter(r => r.status === 'failed').length;
-  const processingRuns = orderRuns.filter(r => r.status === 'processing').length;
-  const queuedRuns = orderRuns.filter(r => r.status === 'queued').length;
+    const totalRuns = orderRuns.length;
+    const completedRuns = orderRuns.filter(r => r.status === 'completed').length;
+    const failedRuns = orderRuns.filter(r => r.status === 'failed').length;
+    const processingRuns = orderRuns.filter(r => r.status === 'processing').length;
+    const queuedRuns = orderRuns.filter(r => r.status === 'queued').length;
+    const cancelledRuns = orderRuns.filter(r => r.status === 'cancelled').length;
 
-  let newStatus;
-  if (completedRuns === totalRuns) {
-    newStatus = 'completed';
-  } else if (failedRuns === totalRuns) {
-    newStatus = 'failed';
-  } else if (processingRuns > 0 || completedRuns > 0 || queuedRuns > 0) {
-    newStatus = 'running';
-  } else {
-    newStatus = 'pending';
-  }
-
-  await Order.updateOne(
-    { schedulerOrderId },
-    {
-      $set: {
-        status: newStatus,
-        completedRuns: completedRuns,
-        totalRuns: totalRuns,
-        lastUpdatedAt: new Date(),
-        runStatuses: orderRuns.map(r => r.status),
+    let newStatus;
+    if (order.status === 'cancelled') {
+      newStatus = 'cancelled'; // 🔥 Don't override manual cancellation
+    } else if (completedRuns + failedRuns + cancelledRuns === totalRuns) {
+      // All runs are done (one way or another)
+      if (completedRuns === totalRuns) {
+        newStatus = 'completed';
+      } else if (failedRuns === totalRuns) {
+        newStatus = 'failed';
+      } else if (cancelledRuns === totalRuns) {
+        newStatus = 'cancelled';
+      } else {
+        newStatus = 'completed'; // Mix of completed/failed/cancelled = completed
       }
+    } else if (processingRuns > 0 || queuedRuns > 0 || completedRuns > 0) {
+      newStatus = 'running';
+    } else {
+      newStatus = 'pending';
     }
-  );
+
+    await Order.updateOne(
+      { schedulerOrderId },
+      {
+        $set: {
+          status: newStatus,
+          completedRuns: completedRuns,
+          totalRuns: totalRuns,
+          lastUpdatedAt: new Date(),
+          runStatuses: orderRuns.map(r => r.status),
+        }
+      }
+    );
+  } catch (err) {
+    console.error(`[updateOrderStatus] Error for ${schedulerOrderId}:`, err.message);
+  }
 }
 
 /* =========================
-   🔥 QUEUE PROCESSORS (FIXED)
+   🔥 FIX 6: QUEUE PROCESSORS (SIMPLIFIED)
+   - No in-memory tracking needed
+   - Each run carries its tickId for verification
+   - MongoDB atomic operations prevent duplicates
 ========================= */
 async function processQueue(queueName, queue, isExecutingFlag, setExecutingFlag) {
   if (isExecutingFlag() || queue.length === 0) return;
 
   setExecutingFlag(true);
-  const run = queue.shift();
-  const runIdStr = run._id.toString();
 
-  console.log(`[${queueName} QUEUE] Processing, Remaining: ${queue.length}`);
-
-  try {
-    // 🔥 Re-fetch from DB to get latest status
-    const freshRun = await Run.findById(run._id);
-
-    if (!freshRun) {
-      console.log(`[${queueName} QUEUE] Run not found in DB, skipping`);
-    } else if (freshRun.status === 'cancelled' || freshRun.status === 'completed' || freshRun.status === 'failed') {
-      console.log(`[${queueName} QUEUE] Run already ${freshRun.status}, skipping`);
-    } else if (freshRun.status === 'processing') {
-      console.log(`[${queueName} QUEUE] Run already processing, skipping`);
-    } else {
-      await executeRun(freshRun);
+  while (queue.length > 0) {
+    const queueItem = queue.shift();
+    
+    if (!queueItem || !queueItem.run || !queueItem.tickId) {
+      console.log(`[${queueName} QUEUE] Invalid queue item, skipping`);
+      continue;
     }
-  } catch (err) {
-    console.error(`[${queueName} QUEUE] Error:`, err);
-  } finally {
-    // 🔥 Remove from queued tracking
-    queuedRunIds.delete(runIdStr);
+
+    const { run, tickId } = queueItem;
+    const runIdStr = run._id.toString();
+
+    console.log(`[${queueName} QUEUE] Processing run ${runIdStr}, Remaining: ${queue.length}`);
+
+    try {
+      // 🔥 Re-verify from DB before executing
+      const freshRun = await Run.findById(run._id);
+
+      if (!freshRun) {
+        console.log(`[${queueName} QUEUE] Run not found in DB, skipping`);
+        continue;
+      }
+
+      // 🔥 Only execute if still in 'queued' state AND claimed by our tick
+      if (freshRun.status !== 'queued') {
+        console.log(`[${queueName} QUEUE] Run status is '${freshRun.status}' (not queued), skipping`);
+        continue;
+      }
+
+      if (freshRun.claimedByTick !== tickId) {
+        console.log(`[${queueName} QUEUE] Run claimed by different tick (${freshRun.claimedByTick} vs ${tickId}), skipping`);
+        continue;
+      }
+
+      await executeRun(freshRun, tickId);
+    } catch (err) {
+      console.error(`[${queueName} QUEUE] Error processing run ${runIdStr}:`, err.message);
+    }
+
+    // 🔥 Delay between executions to avoid rate limiting
+    if (queue.length > 0) {
+      await new Promise(resolve => setTimeout(resolve, 8000));
+    }
   }
 
   setExecutingFlag(false);
-  await new Promise(resolve => setTimeout(resolve, 8000));
-
-  if (queue.length > 0) {
-    setImmediate(() => processQueue(queueName, queue, isExecutingFlag, setExecutingFlag));
-  }
 }
 
-// 🔥 Simplified queue processors using shared function
+// Queue processor starters
 function processViewsQueue() {
   processQueue('VIEWS', viewsQueue, () => isExecutingViews, (v) => { isExecutingViews = v; });
 }
@@ -418,46 +494,10 @@ function processCommentsQueue() {
 }
 
 /* =========================
-   🔥 SAFE QUEUE ADDITION (Atomic)
-========================= */
-async function safeAddToQueue(run) {
-  const runIdStr = run._id.toString();
-
-  // 🔥 CHECK 1: Already in queue or executing?
-  if (queuedRunIds.has(runIdStr) || executingRunIds.has(runIdStr)) {
-    return false;
-  }
-
-  // 🔥 CHECK 2: Atomic transition pending → queued
-  const updated = await atomicStatusTransition(run._id, 'pending', 'queued');
-
-  if (!updated) {
-    // Another scheduler tick already grabbed this run
-    return false;
-  }
-
-  // 🔥 CHECK 3: Verify order isn't cancelled
-  const order = await Order.findOne({ schedulerOrderId: updated.schedulerOrderId });
-  if (!order || order.status === 'cancelled') {
-    await Run.updateOne({ _id: run._id }, { $set: { status: 'cancelled', done: true } });
-    return false;
-  }
-
-  // 🔥 Add to tracking set and queue
-  queuedRunIds.add(runIdStr);
-
-  if (updated.label === 'VIEWS') viewsQueue.push(updated);
-  else if (updated.label === 'LIKES') likesQueue.push(updated);
-  else if (updated.label === 'SHARES') sharesQueue.push(updated);
-  else if (updated.label === 'SAVES') savesQueue.push(updated);
-  else if (updated.label === 'COMMENTS') commentsQueue.push(updated);
-
-  console.log(`[SCHEDULER] Added ${updated.label} run to queue (qty: ${updated.quantity})`);
-  return true;
-}
-
-/* =========================
-   🔥 MAIN SCHEDULER (FIXED)
+   🔥 FIX 7: MAIN SCHEDULER (BULLETPROOF)
+   - Mutex lock prevents concurrent ticks
+   - Each tick gets a unique ID
+   - MongoDB atomic claims prevent any duplicates
 ========================= */
 mongoose.connection.once('open', () => {
   console.log("🚀 Scheduler started after DB connected");
@@ -465,13 +505,14 @@ mongoose.connection.once('open', () => {
   // 🔥 STARTUP: Clean up stuck runs from previous server instance
   (async () => {
     try {
+      // Reset any runs that were in-progress when server crashed
       const stuckProcessing = await Run.updateMany(
         { status: 'processing', executedAt: null },
-        { $set: { status: 'pending', executionLock: null, lockedAt: null } }
+        { $set: { status: 'pending', executionLock: null, lockedAt: null, claimedByTick: null } }
       );
       const stuckQueued = await Run.updateMany(
         { status: 'queued' },
-        { $set: { status: 'pending', executionLock: null, lockedAt: null } }
+        { $set: { status: 'pending', executionLock: null, lockedAt: null, claimedByTick: null } }
       );
       console.log(`[STARTUP] Reset ${stuckProcessing.modifiedCount} stuck processing runs`);
       console.log(`[STARTUP] Reset ${stuckQueued.modifiedCount} stuck queued runs`);
@@ -481,32 +522,88 @@ mongoose.connection.once('open', () => {
   })();
 
   setInterval(async () => {
+    // 🔥 FIX: Mutex — skip if previous tick is still running
+    if (isSchedulerRunning) {
+      console.log('[SCHEDULER] Previous tick still running, skipping...');
+      return;
+    }
+
+    isSchedulerRunning = true;
+    schedulerTickId++;
+    const tickId = `tick-${schedulerTickId}-${Date.now()}`;
+
     try {
       const now = new Date();
       let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0 };
 
-      // 🔥 ONLY fetch pending runs whose time has passed
-      const pendingRuns = await Run.find({
-        status: 'pending',
-        time: { $lte: now },
-      });
+      // 🔥 FIX: Use MongoDB atomic findOneAndUpdate in a loop
+      // Instead of find() then update(), we claim runs one-by-one atomically
+      let claimedCount = 0;
+      const MAX_CLAIMS_PER_TICK = 50; // Safety limit
 
-      for (const run of pendingRuns) {
-        const added = await safeAddToQueue(run);
+      while (claimedCount < MAX_CLAIMS_PER_TICK) {
+        // 🔥 Atomically find AND claim ONE pending run
+        const claimedRun = await Run.findOneAndUpdate(
+          {
+            status: 'pending',
+            time: { $lte: now },
+            executionLock: null,
+            claimedByTick: null,
+          },
+          {
+            $set: {
+              status: 'queued',
+              claimedByTick: tickId,
+              executionLock: `claim-${tickId}`,
+              lockedAt: new Date(),
+            },
+          },
+          {
+            new: true,
+            sort: { time: 1 }, // Process oldest first
+          }
+        );
 
-        if (added) {
-          const label = run.label.toLowerCase();
-          if (label === 'views') addedToQueue.views++;
-          else if (label === 'likes') addedToQueue.likes++;
-          else if (label === 'shares') addedToQueue.shares++;
-          else if (label === 'saves') addedToQueue.saves++;
-          else if (label === 'comments') addedToQueue.comments++;
+        // No more pending runs to claim
+        if (!claimedRun) break;
+
+        // 🔥 Verify order isn't cancelled before adding to queue
+        const order = await Order.findOne({ schedulerOrderId: claimedRun.schedulerOrderId });
+        if (!order || order.status === 'cancelled') {
+          await Run.updateOne(
+            { _id: claimedRun._id },
+            { $set: { status: 'cancelled', done: true } }
+          );
+          continue;
         }
+
+        // 🔥 Add to appropriate queue with tickId
+        const queueItem = { run: claimedRun, tickId };
+
+        if (claimedRun.label === 'VIEWS') {
+          viewsQueue.push(queueItem);
+          addedToQueue.views++;
+        } else if (claimedRun.label === 'LIKES') {
+          likesQueue.push(queueItem);
+          addedToQueue.likes++;
+        } else if (claimedRun.label === 'SHARES') {
+          sharesQueue.push(queueItem);
+          addedToQueue.shares++;
+        } else if (claimedRun.label === 'SAVES') {
+          savesQueue.push(queueItem);
+          addedToQueue.saves++;
+        } else if (claimedRun.label === 'COMMENTS') {
+          commentsQueue.push(queueItem);
+          addedToQueue.comments++;
+        }
+
+        claimedCount++;
+        console.log(`[SCHEDULER] Claimed ${claimedRun.label} run (qty: ${claimedRun.quantity}) [${tickId}]`);
       }
 
       const totalAdded = addedToQueue.views + addedToQueue.likes + addedToQueue.shares + addedToQueue.saves + addedToQueue.comments;
       if (totalAdded > 0) {
-        console.log(`[SCHEDULER] Added to queues - Views: ${addedToQueue.views}, Likes: ${addedToQueue.likes}, Shares: ${addedToQueue.shares}, Saves: ${addedToQueue.saves}, Comments: ${addedToQueue.comments}`);
+        console.log(`[SCHEDULER] [${tickId}] Claimed ${totalAdded} runs - Views: ${addedToQueue.views}, Likes: ${addedToQueue.likes}, Shares: ${addedToQueue.shares}, Saves: ${addedToQueue.saves}, Comments: ${addedToQueue.comments}`);
       }
 
       // 🔥 Start processors if needed
@@ -518,6 +615,8 @@ mongoose.connection.once('open', () => {
 
     } catch (error) {
       console.error('[SCHEDULER] Error:', error);
+    } finally {
+      isSchedulerRunning = false; // 🔥 Always release the lock
     }
   }, 10000);
 });
@@ -661,34 +760,40 @@ app.post('/api/order/control', async (req, res) => {
     }
 
     const order = await Order.findOne({ schedulerOrderId });
-    const orderRuns = await Run.find({ schedulerOrderId });
-
     if (!order) {
       return res.status(404).json({ error: 'Order not found' });
     }
 
     if (action === 'cancel') {
-      // 🔥 Bulk update all cancellable runs
+      // 🔥 Bulk cancel all non-completed runs
       await Run.updateMany(
         {
           schedulerOrderId,
           status: { $in: ['pending', 'processing', 'queued'] }
         },
-        { $set: { status: 'cancelled', done: true } }
+        { $set: { status: 'cancelled', done: true, executionLock: null, claimedByTick: null } }
       );
 
       // 🔥 Remove from in-memory queues
-      const orderRunIds = new Set(orderRuns.map(r => r._id.toString()));
-      viewsQueue = viewsQueue.filter(r => !orderRunIds.has(r._id.toString()));
-      likesQueue = likesQueue.filter(r => !orderRunIds.has(r._id.toString()));
-      sharesQueue = sharesQueue.filter(r => !orderRunIds.has(r._id.toString()));
-      savesQueue = savesQueue.filter(r => !orderRunIds.has(r._id.toString()));
-      commentsQueue = commentsQueue.filter(r => !orderRunIds.has(r._id.toString()));
-
-      // 🔥 Remove from tracking sets
-      orderRunIds.forEach(id => {
-        queuedRunIds.delete(id);
-        // Note: executingRunIds will be cleaned up when execution finishes
+      viewsQueue = viewsQueue.filter(item => {
+        const run = item.run || item;
+        return run.schedulerOrderId !== schedulerOrderId;
+      });
+      likesQueue = likesQueue.filter(item => {
+        const run = item.run || item;
+        return run.schedulerOrderId !== schedulerOrderId;
+      });
+      sharesQueue = sharesQueue.filter(item => {
+        const run = item.run || item;
+        return run.schedulerOrderId !== schedulerOrderId;
+      });
+      savesQueue = savesQueue.filter(item => {
+        const run = item.run || item;
+        return run.schedulerOrderId !== schedulerOrderId;
+      });
+      commentsQueue = commentsQueue.filter(item => {
+        const run = item.run || item;
+        return run.schedulerOrderId !== schedulerOrderId;
       });
 
       await Order.updateOne(
@@ -711,18 +816,30 @@ app.post('/api/order/control', async (req, res) => {
           schedulerOrderId,
           status: { $in: ['pending', 'queued'] }
         },
-        { $set: { status: 'paused' } }
+        { $set: { status: 'paused', executionLock: null, claimedByTick: null } }
       );
 
       // Remove from queues
-      const orderRunIds = new Set(orderRuns.map(r => r._id.toString()));
-      viewsQueue = viewsQueue.filter(r => !orderRunIds.has(r._id.toString()));
-      likesQueue = likesQueue.filter(r => !orderRunIds.has(r._id.toString()));
-      sharesQueue = sharesQueue.filter(r => !orderRunIds.has(r._id.toString()));
-      savesQueue = savesQueue.filter(r => !orderRunIds.has(r._id.toString()));
-      commentsQueue = commentsQueue.filter(r => !orderRunIds.has(r._id.toString()));
-
-      orderRunIds.forEach(id => queuedRunIds.delete(id));
+      viewsQueue = viewsQueue.filter(item => {
+        const run = item.run || item;
+        return run.schedulerOrderId !== schedulerOrderId;
+      });
+      likesQueue = likesQueue.filter(item => {
+        const run = item.run || item;
+        return run.schedulerOrderId !== schedulerOrderId;
+      });
+      sharesQueue = sharesQueue.filter(item => {
+        const run = item.run || item;
+        return run.schedulerOrderId !== schedulerOrderId;
+      });
+      savesQueue = savesQueue.filter(item => {
+        const run = item.run || item;
+        return run.schedulerOrderId !== schedulerOrderId;
+      });
+      commentsQueue = commentsQueue.filter(item => {
+        const run = item.run || item;
+        return run.schedulerOrderId !== schedulerOrderId;
+      });
 
       await Order.updateOne(
         { schedulerOrderId },
@@ -744,7 +861,7 @@ app.post('/api/order/control', async (req, res) => {
           schedulerOrderId,
           status: 'paused'
         },
-        { $set: { status: 'pending' } }
+        { $set: { status: 'pending', executionLock: null, claimedByTick: null } }
       );
 
       await Order.updateOne(
@@ -808,53 +925,50 @@ app.get('/api/queues/status', (req, res) => {
     views: {
       queueLength: viewsQueue.length,
       isExecuting: isExecutingViews,
-      pending: viewsQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
     },
     likes: {
       queueLength: likesQueue.length,
       isExecuting: isExecutingLikes,
-      pending: likesQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
     },
     shares: {
       queueLength: sharesQueue.length,
       isExecuting: isExecutingShares,
-      pending: sharesQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
     },
     saves: {
       queueLength: savesQueue.length,
       isExecuting: isExecutingSaves,
-      pending: savesQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
     },
     comments: {
       queueLength: commentsQueue.length,
       isExecuting: isExecutingComments,
-      pending: commentsQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
     },
-    // 🔥 NEW: Debug info
-    tracking: {
-      executingCount: executingRunIds.size,
-      queuedCount: queuedRunIds.size,
+    scheduler: {
+      isRunning: isSchedulerRunning,
+      lastTickId: schedulerTickId,
     }
   });
 });
 
 app.post('/api/runs/retry-stuck', async (req, res) => {
   try {
-    // 🔥 Reset stuck processing runs (no executedAt = never actually executed)
+    // Reset stuck processing runs (no executedAt = never actually executed)
     const stuckProcessing = await Run.updateMany(
       { status: 'processing', executedAt: null, lockedAt: { $lt: new Date(Date.now() - 120000) } },
-      { $set: { status: 'pending', executionLock: null, lockedAt: null } }
+      { $set: { status: 'pending', executionLock: null, lockedAt: null, claimedByTick: null } }
     );
 
-    // 🔥 Reset orphaned queued runs
+    // Reset orphaned queued runs (stuck for over 2 minutes)
     const stuckQueued = await Run.updateMany(
-      { status: 'queued' },
-      { $set: { status: 'pending', executionLock: null, lockedAt: null } }
+      { status: 'queued', lockedAt: { $lt: new Date(Date.now() - 120000) } },
+      { $set: { status: 'pending', executionLock: null, lockedAt: null, claimedByTick: null } }
     );
 
-    // 🔥 Clear tracking sets
-    queuedRunIds.clear();
-    executingRunIds.clear();
+    // 🔥 Clear in-memory queues too
+    viewsQueue = [];
+    likesQueue = [];
+    sharesQueue = [];
+    savesQueue = [];
+    commentsQueue = [];
 
     return res.json({
       success: true,
@@ -869,24 +983,50 @@ app.post('/api/runs/retry-stuck', async (req, res) => {
 
 app.post('/api/scheduler/trigger', async (req, res) => {
   try {
+    if (isSchedulerRunning) {
+      return res.json({
+        success: false,
+        message: 'Scheduler is already running, try again in a few seconds',
+      });
+    }
+
+    // 🔥 Manually trigger a scheduler tick
     const now = new Date();
+    const tickId = `manual-${Date.now()}`;
     let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0 };
 
-    const pendingRuns = await Run.find({
-      status: 'pending',
-      time: { $lte: now },
-    });
+    let claimedCount = 0;
+    while (claimedCount < 50) {
+      const claimedRun = await Run.findOneAndUpdate(
+        {
+          status: 'pending',
+          time: { $lte: now },
+          executionLock: null,
+          claimedByTick: null,
+        },
+        {
+          $set: {
+            status: 'queued',
+            claimedByTick: tickId,
+            executionLock: `claim-${tickId}`,
+            lockedAt: new Date(),
+          },
+        },
+        { new: true, sort: { time: 1 } }
+      );
 
-    for (const run of pendingRuns) {
-      const added = await safeAddToQueue(run);
-      if (added) {
-        const label = run.label.toLowerCase();
-        if (label === 'views') addedToQueue.views++;
-        else if (label === 'likes') addedToQueue.likes++;
-        else if (label === 'shares') addedToQueue.shares++;
-        else if (label === 'saves') addedToQueue.saves++;
-        else if (label === 'comments') addedToQueue.comments++;
-      }
+      if (!claimedRun) break;
+
+      const queueItem = { run: claimedRun, tickId };
+      const label = claimedRun.label;
+
+      if (label === 'VIEWS') { viewsQueue.push(queueItem); addedToQueue.views++; }
+      else if (label === 'LIKES') { likesQueue.push(queueItem); addedToQueue.likes++; }
+      else if (label === 'SHARES') { sharesQueue.push(queueItem); addedToQueue.shares++; }
+      else if (label === 'SAVES') { savesQueue.push(queueItem); addedToQueue.saves++; }
+      else if (label === 'COMMENTS') { commentsQueue.push(queueItem); addedToQueue.comments++; }
+
+      claimedCount++;
     }
 
     if (viewsQueue.length > 0 && !isExecutingViews) processViewsQueue();
@@ -897,6 +1037,7 @@ app.post('/api/scheduler/trigger', async (req, res) => {
 
     return res.json({
       success: true,
+      tickId,
       addedToQueue,
       currentQueues: {
         views: viewsQueue.length,
@@ -927,6 +1068,8 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`Minimum views per run: ${MIN_VIEWS_PER_RUN}`);
   console.log(`5 Queue system: VIEWS | LIKES | SHARES | SAVES | COMMENTS`);
   console.log(`Scheduler runs every 10 seconds`);
-  console.log(`🔒 Atomic execution locks ENABLED`);
+  console.log(`🔒 Bulletproof atomic execution locks ENABLED`);
+  console.log(`🔒 Scheduler mutex ENABLED`);
+  console.log(`🔒 Tick-based claim tracking ENABLED`);
   console.log(`========================================`);
 });
