@@ -55,7 +55,7 @@ const RunSchema = new mongoose.Schema({
 
 // 🔥 COMPOUND INDEXES for atomic operations
 RunSchema.index({ status: 1, time: 1 });
-RunSchema.index({ _id: 1, status: 1 });
+RunSchema.index({ _id: 1, status: 1 }); 
 RunSchema.index({ schedulerOrderId: 1, status: 1 });
 
 const OrderSchema = new mongoose.Schema({
