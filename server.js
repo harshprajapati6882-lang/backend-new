@@ -417,15 +417,26 @@ async function executeRun(run, tickId) {
         }
       );
 
-      // 🔥 NOTIFICATION: Run failed
+            // 🔥 NOTIFICATION: Order cancelled
       await createNotification({
-        type: 'run_failed',
-        severity: 'critical',
-        title: `${lockedRun.label} run failed`,
-        message: `${lockedRun.label} run (qty: ${lockedRun.quantity}) failed: ${errorMsg}`,
-        schedulerOrderId: lockedRun.schedulerOrderId,
-        runId: run._id.toString(),
-        label: lockedRun.label,
+        type: 'order_cancelled',
+        severity: 'info',
+        title: `Order cancelled`,
+        message: `Order ${schedulerOrderId} was manually cancelled`,
+        schedulerOrderId,
+      });
+
+      await Order.updateOne(
+        { schedulerOrderId },
+        { $set: { status: 'cancelled', lastUpdatedAt: new Date() } }
+      );
+
+      const updatedRuns = await Run.find({ schedulerOrderId });
+      return res.json({
+        success: true,
+        status: 'cancelled',
+        completedRuns: updatedRuns.filter(r => r.status === 'completed').length,
+        runStatuses: updatedRuns.map(r => r.status),
       });
     }
 
@@ -734,11 +745,53 @@ mongoose.connection.once('open', () => {
       if (savesQueue.length > 0 && !isExecutingSaves) processSavesQueue();
       if (commentsQueue.length > 0 && !isExecutingComments) processCommentsQueue();
 
-    } catch (error) {
+        } catch (error) {
       console.error('[SCHEDULER] Error:', error);
-          // 🔥 NOTIFICATION: Check for stuck runs
-      try {
-        const stuckProcessingRuns = await Run.find({
+    }
+
+    // 🔥 NOTIFICATION: Check for stuck runs (runs every tick, outside try/catch)
+    try {
+      const stuckProcessingRuns = await Run.find({
+        status: 'processing',
+        executedAt: null,
+        lockedAt: { $lt: new Date(Date.now() - 25 * 60 * 1000) },
+      });
+
+      for (const stuckRun of stuckProcessingRuns) {
+        await createNotification({
+          type: 'run_stuck',
+          severity: 'warning',
+          title: `${stuckRun.label} run stuck in processing`,
+          message: `${stuckRun.label} run (qty: ${stuckRun.quantity}) has been processing for over 25 minutes without completing.`,
+          schedulerOrderId: stuckRun.schedulerOrderId,
+          runId: stuckRun._id.toString(),
+          label: stuckRun.label,
+        });
+      }
+
+      const stuckQueuedRuns = await Run.find({
+        status: 'queued',
+        lockedAt: { $lt: new Date(Date.now() - 10 * 60 * 1000) },
+      });
+
+      for (const stuckRun of stuckQueuedRuns) {
+        await createNotification({
+          type: 'run_stuck_queued',
+          severity: 'warning',
+          title: `${stuckRun.label} run stuck in queue`,
+          message: `${stuckRun.label} run (qty: ${stuckRun.quantity}) has been queued for over 10 minutes without execution.`,
+          schedulerOrderId: stuckRun.schedulerOrderId,
+          runId: stuckRun._id.toString(),
+          label: stuckRun.label,
+        });
+      }
+    } catch (notifErr) {
+      console.error('[SCHEDULER] Notification check error:', notifErr.message);
+    }
+
+    isSchedulerRunning = false;
+  }, 10000);
+});
           status: 'processing',
           executedAt: null,
           lockedAt: { $lt: new Date(Date.now() - 25 * 60 * 1000) }, // 25 minutes for views
@@ -776,9 +829,6 @@ mongoose.connection.once('open', () => {
         console.error('[SCHEDULER] Notification check error:', notifErr.message);
       }
 
-    } finally {
-      isSchedulerRunning = false;
-    }
   }, 10000);
 });
 
@@ -1348,10 +1398,10 @@ app.post('/api/provider/check-status', async (req, res) => {
 ========================= */
 app.get('/api/notifications', async (req, res) => {
   try {
-    const limit = parseInt(req.query.limit as string) || 50;
+        const limit = parseInt(req.query.limit) || 50;
     const unreadOnly = req.query.unread === 'true';
 
-    const filter: any = {};
+    const filter = {};
     if (unreadOnly) filter.read = false;
 
     const notifications = await Notification.find(filter)
