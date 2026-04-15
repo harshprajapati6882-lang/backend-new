@@ -128,7 +128,34 @@ async function placeOrder({ apiUrl, apiKey, service, link, quantity, comments })
 
 /* =========================
    ADD RUNS TO DATABASE
+   🔥 STAGGERED EXECUTION:
+   - Views execute at exact scheduled time (T+0)
+   - Likes execute T+3 to T+7 minutes later (random)
+   - Shares execute T+8 to T+12 minutes later (random)
+   - Saves execute T+10 to T+15 minutes later (random)
+   - Comments execute T+12 to T+18 minutes later (random)
+   This makes engagement look organic — views first, then reactions follow naturally
 ========================= */
+function getServiceDelay(label) {
+  // Returns delay in milliseconds
+  // Views always at T+0
+  // Other services get random delay within their range
+  switch (label) {
+    case 'VIEWS':
+      return 0;
+    case 'LIKES':
+      return (3 + Math.random() * 4) * 60 * 1000;  // 3-7 minutes
+    case 'SHARES':
+      return (8 + Math.random() * 4) * 60 * 1000;  // 8-12 minutes
+    case 'SAVES':
+      return (10 + Math.random() * 5) * 60 * 1000; // 10-15 minutes
+    case 'COMMENTS':
+      return (12 + Math.random() * 6) * 60 * 1000; // 12-18 minutes
+    default:
+      return 0;
+  }
+}
+
 async function addRuns(services, baseConfig, schedulerOrderId) {
   const runsForOrder = [];
 
@@ -160,6 +187,13 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
         quantity = run.quantity;
       }
 
+      // 🔥 STAGGERED: Calculate delayed time based on service type
+      const baseTime = new Date(run.time).getTime();
+      const delay = getServiceDelay(label);
+      const staggeredTime = new Date(baseTime + delay);
+
+      console.log(`[ADD RUN] ${label} qty=${quantity} | base=${new Date(baseTime).toISOString()} | delay=${Math.round(delay / 60000)}min | actual=${staggeredTime.toISOString()}`);
+
       const runData = new Run({
         id: Date.now() + Math.random(),
         schedulerOrderId,
@@ -169,7 +203,7 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
         service: serviceConfig.serviceId,
         link: baseConfig.link,
         quantity: quantity,
-        time: run.time,
+        time: staggeredTime, // 🔥 Use staggered time instead of original
         done: false,
         status: 'pending',
         smmOrderId: null,
