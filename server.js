@@ -798,23 +798,41 @@ app.post('/api/order', async (req, res) => {
     console.log('Creating new order...');
 
     const schedulerOrderId = `sched-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-    const runsForOrder = await addRuns(services, { apiUrl, apiKey, link }, schedulerOrderId);
 
+    // 🔥 FIX: Save Order FIRST, then runs
+    // This prevents the scheduler from finding runs before the Order exists
+    // (which would cause "Order not found" → run cancelled)
     const orderData = new Order({
       schedulerOrderId,
       name: name || `Order ${schedulerOrderId}`,
       link,
       status: 'pending',
-      totalRuns: runsForOrder.length,
+      totalRuns: 0,
       completedRuns: 0,
-      runStatuses: runsForOrder.map(() => 'pending'),
+      runStatuses: [],
       createdAt: new Date(),
       lastUpdatedAt: new Date(),
     });
 
     await orderData.save();
+    console.log(`Order document created: ${schedulerOrderId}`);
 
-    console.log(`Order created: ${schedulerOrderId} with ${runsForOrder.length} runs`);
+    // 🔥 Now save runs — Order already exists so scheduler won't cancel them
+    const runsForOrder = await addRuns(services, { apiUrl, apiKey, link }, schedulerOrderId);
+
+    // 🔥 Update Order with correct run count
+    await Order.updateOne(
+      { schedulerOrderId },
+      {
+        $set: {
+          totalRuns: runsForOrder.length,
+          runStatuses: runsForOrder.map(() => 'pending'),
+          lastUpdatedAt: new Date(),
+        }
+      }
+    );
+
+    console.log(`Order updated: ${schedulerOrderId} with ${runsForOrder.length} runs`);
 
     return res.json({
       success: true,
