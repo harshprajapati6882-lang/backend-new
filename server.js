@@ -1069,6 +1069,120 @@ setInterval(async () => {
   } catch (e) {}
 }, 5 * 60 * 1000);
 
+/* =========================
+   🔥 NEW: Check provider order status
+========================= */
+app.post('/api/provider/check-status', async (req, res) => {
+  try {
+    const { schedulerOrderId } = req.body;
+    if (!schedulerOrderId) {
+      return res.status(400).json({ error: 'Missing schedulerOrderId' });
+    }
+
+    // Get all completed runs for this order that have a smmOrderId
+    const runs = await Run.find({
+      schedulerOrderId,
+      status: 'completed',
+      smmOrderId: { $ne: null },
+    });
+
+    if (runs.length === 0) {
+      return res.json({ schedulerOrderId, results: [], message: 'No completed runs to check' });
+    }
+
+    // Group runs by API (apiUrl + apiKey) to batch check per provider
+    const apiGroups = new Map();
+    runs.forEach(run => {
+      const key = `${run.apiUrl}|||${run.apiKey}`;
+      if (!apiGroups.has(key)) {
+        apiGroups.set(key, { apiUrl: run.apiUrl, apiKey: run.apiKey, runs: [] });
+      }
+      apiGroups.get(key).runs.push(run);
+    });
+
+    const results = [];
+
+    for (const [, group] of apiGroups) {
+      // Build comma-separated order IDs for batch check
+      const orderIds = group.runs.map(r => r.smmOrderId).join(',');
+
+      try {
+        const params = new URLSearchParams({
+          key: group.apiKey,
+          action: 'status',
+          orders: orderIds,
+        });
+
+        const response = await axios.post(group.apiUrl, params.toString(), {
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          timeout: 15000,
+        });
+
+        const providerData = response.data;
+
+        // Process each run's provider status
+        for (const run of group.runs) {
+          const orderStatus = providerData[String(run.smmOrderId)];
+
+          if (!orderStatus || orderStatus.error) {
+            results.push({
+              runId: run._id,
+              smmOrderId: run.smmOrderId,
+              label: run.label,
+              providerStatus: 'unknown',
+              error: orderStatus?.error || 'Not found in response',
+            });
+            continue;
+          }
+
+          const providerStatus = orderStatus.status || 'unknown';
+          const remains = parseInt(orderStatus.remains || '0', 10);
+          const startCount = parseInt(orderStatus.start_count || '0', 10);
+
+          results.push({
+            runId: run._id,
+            smmOrderId: run.smmOrderId,
+            label: run.label,
+            providerStatus,
+            remains,
+            startCount,
+            charge: orderStatus.charge,
+            currency: orderStatus.currency,
+          });
+
+          // 🔥 If provider cancelled/partial, update run in DB
+          if (providerStatus === 'Cancelled') {
+            await Run.updateOne(
+              { _id: run._id },
+              { $set: { error: 'Provider cancelled this order' } }
+            );
+          } else if (providerStatus === 'Partial') {
+            await Run.updateOne(
+              { _id: run._id },
+              { $set: { error: `Partial: ${remains} remaining out of ${startCount + remains}` } }
+            );
+          }
+        }
+      } catch (apiError) {
+        console.error('[Provider Status Check] API error:', apiError.message);
+        for (const run of group.runs) {
+          results.push({
+            runId: run._id,
+            smmOrderId: run.smmOrderId,
+            label: run.label,
+            providerStatus: 'error',
+            error: apiError.message,
+          });
+        }
+      }
+    }
+
+    return res.json({ schedulerOrderId, total: results.length, results });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`========================================`);
   console.log(`Server running on port ${PORT}`);
