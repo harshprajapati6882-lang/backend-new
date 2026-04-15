@@ -70,8 +70,49 @@ const OrderSchema = new mongoose.Schema({
   lastUpdatedAt: { type: Date, default: Date.now },
 });
 
+const NotificationSchema = new mongoose.Schema({
+  type: { type: String, required: true, index: true },
+  severity: { type: String, required: true, index: true },
+  title: { type: String, required: true },
+  message: { type: String, required: true },
+  schedulerOrderId: { type: String, default: null, index: true },
+  runId: { type: String, default: null },
+  label: { type: String, default: null },
+  smmOrderId: { type: Number, default: null },
+  read: { type: Boolean, default: false, index: true },
+  createdAt: { type: Date, default: Date.now, index: true },
+});
+
+NotificationSchema.index({ createdAt: -1 });
+NotificationSchema.index({ read: 1, createdAt: -1 });
+
 const Run = mongoose.model('Run', RunSchema);
 const Order = mongoose.model('Order', OrderSchema);
+const Notification = mongoose.model('Notification', NotificationSchema);
+
+/* =========================
+   🔥 NOTIFICATION HELPER
+========================= */
+async function createNotification({ type, severity, title, message, schedulerOrderId, runId, label, smmOrderId }) {
+  try {
+    const notif = new Notification({
+      type,
+      severity,
+      title,
+      message,
+      schedulerOrderId: schedulerOrderId || null,
+      runId: runId || null,
+      label: label || null,
+      smmOrderId: smmOrderId || null,
+      read: false,
+      createdAt: new Date(),
+    });
+    await notif.save();
+    console.log(`[NOTIFICATION] ${severity.toUpperCase()}: ${title}`);
+  } catch (err) {
+    console.error('[NOTIFICATION] Failed to save:', err.message);
+  }
+}
 
 /* =========================
    MINIMUM VIEWS PER RUN
@@ -360,37 +401,62 @@ async function executeRun(run, tickId) {
       if (!completed) {
         console.warn(`[${lockedRun.label}] WARNING: Run completed but status update failed (may have been cancelled)`);
       }
-    } else {
+        } else {
       console.error(`[${lockedRun.label}] FAILED`, result);
+
+      const errorMsg = result?.error || 'Unknown error';
 
       await Run.findOneAndUpdate(
         { _id: run._id, status: 'processing' },
         {
           $set: {
             status: 'failed',
-            error: result?.error || 'Unknown error',
+            error: errorMsg,
             done: true,
           }
         }
       );
+
+      // 🔥 NOTIFICATION: Run failed
+      await createNotification({
+        type: 'run_failed',
+        severity: 'critical',
+        title: `${lockedRun.label} run failed`,
+        message: `${lockedRun.label} run (qty: ${lockedRun.quantity}) failed: ${errorMsg}`,
+        schedulerOrderId: lockedRun.schedulerOrderId,
+        runId: run._id.toString(),
+        label: lockedRun.label,
+      });
     }
 
-  } catch (err) {
+    } catch (err) {
     console.error(`[${run.label}] ERROR`, err.response?.data || err.message);
 
-    // 🔥 Only update if still in processing state
+    const errorMsg = err.response?.data?.error || err.message;
+
     if (run?._id) {
       await Run.findOneAndUpdate(
         { _id: run._id, status: 'processing' },
         {
           $set: {
             status: 'failed',
-            error: err.response?.data?.error || err.message,
+            error: errorMsg,
             done: true,
           }
         }
       );
     }
+
+    // 🔥 NOTIFICATION: Run error
+    await createNotification({
+      type: 'run_error',
+      severity: 'critical',
+      title: `${run.label} run error`,
+      message: `${run.label} run (qty: ${run.quantity}) threw error: ${errorMsg}`,
+      schedulerOrderId: run.schedulerOrderId,
+      runId: run?._id?.toString(),
+      label: run.label,
+    });
   } finally {
     await updateOrderStatus(run.schedulerOrderId);
   }
@@ -433,6 +499,17 @@ async function updateOrderStatus(schedulerOrderId) {
       newStatus = 'running';
     } else {
       newStatus = 'pending';
+    }
+
+       // 🔥 NOTIFICATION: Order has failed runs
+    if (newStatus === 'completed' && failedRuns > 0) {
+      await createNotification({
+        type: 'order_partial_failure',
+        severity: 'warning',
+        title: `Order completed with failures`,
+        message: `Order ${schedulerOrderId}: ${completedRuns} completed, ${failedRuns} failed, ${cancelledRuns} cancelled out of ${totalRuns} total runs.`,
+        schedulerOrderId,
+      });
     }
 
     await Order.updateOne(
@@ -550,6 +627,16 @@ mongoose.connection.once('open', () => {
       );
       console.log(`[STARTUP] Reset ${stuckProcessing.modifiedCount} stuck processing runs`);
       console.log(`[STARTUP] Reset ${stuckQueued.modifiedCount} stuck queued runs`);
+             // 🔥 NOTIFICATION: Server restart
+      const totalReset = stuckProcessing.modifiedCount + stuckQueued.modifiedCount;
+      if (totalReset > 0) {
+        await createNotification({
+          type: 'server_restart',
+          severity: 'info',
+          title: 'Server restarted',
+          message: `Server restarted. Reset ${stuckProcessing.modifiedCount} processing + ${stuckQueued.modifiedCount} queued runs back to pending.`,
+        });
+      }
     } catch (err) {
       console.error('[STARTUP] Error cleaning stuck runs:', err);
     }
@@ -649,8 +736,48 @@ mongoose.connection.once('open', () => {
 
     } catch (error) {
       console.error('[SCHEDULER] Error:', error);
+          // 🔥 NOTIFICATION: Check for stuck runs
+      try {
+        const stuckProcessingRuns = await Run.find({
+          status: 'processing',
+          executedAt: null,
+          lockedAt: { $lt: new Date(Date.now() - 25 * 60 * 1000) }, // 25 minutes for views
+        });
+
+        for (const stuckRun of stuckProcessingRuns) {
+          await createNotification({
+            type: 'run_stuck',
+            severity: 'warning',
+            title: `${stuckRun.label} run stuck in processing`,
+            message: `${stuckRun.label} run (qty: ${stuckRun.quantity}) has been processing for over 25 minutes without completing.`,
+            schedulerOrderId: stuckRun.schedulerOrderId,
+            runId: stuckRun._id.toString(),
+            label: stuckRun.label,
+          });
+        }
+
+        const stuckQueuedRuns = await Run.find({
+          status: 'queued',
+          lockedAt: { $lt: new Date(Date.now() - 10 * 60 * 1000) }, // 10 minutes
+        });
+
+        for (const stuckRun of stuckQueuedRuns) {
+          await createNotification({
+            type: 'run_stuck_queued',
+            severity: 'warning',
+            title: `${stuckRun.label} run stuck in queue`,
+            message: `${stuckRun.label} run (qty: ${stuckRun.quantity}) has been queued for over 10 minutes without execution.`,
+            schedulerOrderId: stuckRun.schedulerOrderId,
+            runId: stuckRun._id.toString(),
+            label: stuckRun.label,
+          });
+        }
+      } catch (notifErr) {
+        console.error('[SCHEDULER] Notification check error:', notifErr.message);
+      }
+
     } finally {
-      isSchedulerRunning = false; // 🔥 Always release the lock
+      isSchedulerRunning = false;
     }
   }, 10000);
 });
@@ -830,15 +957,14 @@ app.post('/api/order/control', async (req, res) => {
         return run.schedulerOrderId !== schedulerOrderId;
       });
 
-      await Order.updateOne(
-        { schedulerOrderId },
-        { $set: { status: 'cancelled', lastUpdatedAt: new Date() } }
-      );
-
-      const updatedRuns = await Run.find({ schedulerOrderId });
-      return res.json({
-        success: true,
-        status: 'cancelled',
+            // 🔥 NOTIFICATION: Order cancelled
+      await createNotification({
+        type: 'order_cancelled',
+        severity: 'info',
+        title: `Order cancelled`,
+        message: `Order ${schedulerOrderId} was manually cancelled`,
+        schedulerOrderId,
+      });
         completedRuns: updatedRuns.filter(r => r.status === 'completed').length,
         runStatuses: updatedRuns.map(r => r.status),
       });
@@ -1212,6 +1338,62 @@ app.post('/api/provider/check-status', async (req, res) => {
     }
 
     return res.json({ schedulerOrderId, total: results.length, results });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+/* =========================
+   🔥 NOTIFICATION API ENDPOINTS
+========================= */
+app.get('/api/notifications', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit as string) || 50;
+    const unreadOnly = req.query.unread === 'true';
+
+    const filter: any = {};
+    if (unreadOnly) filter.read = false;
+
+    const notifications = await Notification.find(filter)
+      .sort({ createdAt: -1 })
+      .limit(limit);
+
+    const unreadCount = await Notification.countDocuments({ read: false });
+
+    return res.json({
+      total: notifications.length,
+      unreadCount,
+      notifications,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/notifications/mark-read', async (req, res) => {
+  try {
+    const { notificationId, markAll } = req.body;
+
+    if (markAll) {
+      await Notification.updateMany({ read: false }, { $set: { read: true } });
+      return res.json({ success: true, message: 'All notifications marked as read' });
+    }
+
+    if (notificationId) {
+      await Notification.updateOne({ _id: notificationId }, { $set: { read: true } });
+      return res.json({ success: true });
+    }
+
+    return res.status(400).json({ error: 'Missing notificationId or markAll' });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/notifications/clear', async (req, res) => {
+  try {
+    const result = await Notification.deleteMany({});
+    return res.json({ success: true, deleted: result.deletedCount });
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
