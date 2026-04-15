@@ -745,51 +745,51 @@ mongoose.connection.once('open', () => {
       if (savesQueue.length > 0 && !isExecutingSaves) processSavesQueue();
       if (commentsQueue.length > 0 && !isExecutingComments) processCommentsQueue();
 
-        } catch (error) {
+            } catch (error) {
       console.error('[SCHEDULER] Error:', error);
-    }
-
-    // 🔥 NOTIFICATION: Check for stuck runs (runs every tick, outside try/catch)
-    try {
-      const stuckProcessingRuns = await Run.find({
-        status: 'processing',
-        executedAt: null,
-        lockedAt: { $lt: new Date(Date.now() - 25 * 60 * 1000) },
-      });
-
-      for (const stuckRun of stuckProcessingRuns) {
-        await createNotification({
-          type: 'run_stuck',
-          severity: 'warning',
-          title: `${stuckRun.label} run stuck in processing`,
-          message: `${stuckRun.label} run (qty: ${stuckRun.quantity}) has been processing for over 25 minutes without completing.`,
-          schedulerOrderId: stuckRun.schedulerOrderId,
-          runId: stuckRun._id.toString(),
-          label: stuckRun.label,
+    } finally {
+      // 🔥 NOTIFICATION: Check for stuck runs
+      try {
+        const stuckProcessingRuns = await Run.find({
+          status: 'processing',
+          executedAt: null,
+          lockedAt: { $lt: new Date(Date.now() - 25 * 60 * 1000) },
         });
+
+        for (const stuckRun of stuckProcessingRuns) {
+          await createNotification({
+            type: 'run_stuck',
+            severity: 'warning',
+            title: stuckRun.label + ' run stuck in processing',
+            message: stuckRun.label + ' run (qty: ' + stuckRun.quantity + ') has been processing for over 25 minutes without completing.',
+            schedulerOrderId: stuckRun.schedulerOrderId,
+            runId: stuckRun._id.toString(),
+            label: stuckRun.label,
+          });
+        }
+
+        const stuckQueuedRuns = await Run.find({
+          status: 'queued',
+          lockedAt: { $lt: new Date(Date.now() - 10 * 60 * 1000) },
+        });
+
+        for (const stuckRun of stuckQueuedRuns) {
+          await createNotification({
+            type: 'run_stuck_queued',
+            severity: 'warning',
+            title: stuckRun.label + ' run stuck in queue',
+            message: stuckRun.label + ' run (qty: ' + stuckRun.quantity + ') has been queued for over 10 minutes without execution.',
+            schedulerOrderId: stuckRun.schedulerOrderId,
+            runId: stuckRun._id.toString(),
+            label: stuckRun.label,
+          });
+        }
+      } catch (notifErr) {
+        console.error('[SCHEDULER] Notification check error:', notifErr.message);
       }
 
-      const stuckQueuedRuns = await Run.find({
-        status: 'queued',
-        lockedAt: { $lt: new Date(Date.now() - 10 * 60 * 1000) },
-      });
-
-      for (const stuckRun of stuckQueuedRuns) {
-        await createNotification({
-          type: 'run_stuck_queued',
-          severity: 'warning',
-          title: `${stuckRun.label} run stuck in queue`,
-          message: `${stuckRun.label} run (qty: ${stuckRun.quantity}) has been queued for over 10 minutes without execution.`,
-          schedulerOrderId: stuckRun.schedulerOrderId,
-          runId: stuckRun._id.toString(),
-          label: stuckRun.label,
-        });
-      }
-    } catch (notifErr) {
-      console.error('[SCHEDULER] Notification check error:', notifErr.message);
+      isSchedulerRunning = false;
     }
-
-    isSchedulerRunning = false;
   }, 10000);
 });
           status: 'processing',
