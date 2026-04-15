@@ -401,7 +401,7 @@ async function executeRun(run, tickId) {
       if (!completed) {
         console.warn(`[${lockedRun.label}] WARNING: Run completed but status update failed (may have been cancelled)`);
       }
-        } else {
+            } else {
       console.error(`[${lockedRun.label}] FAILED`, result);
 
       const errorMsg = result?.error || 'Unknown error';
@@ -417,26 +417,15 @@ async function executeRun(run, tickId) {
         }
       );
 
-            // 🔥 NOTIFICATION: Order cancelled
+      // 🔥 NOTIFICATION: Run failed
       await createNotification({
-        type: 'order_cancelled',
-        severity: 'info',
-        title: `Order cancelled`,
-        message: `Order ${schedulerOrderId} was manually cancelled`,
-        schedulerOrderId,
-      });
-
-      await Order.updateOne(
-        { schedulerOrderId },
-        { $set: { status: 'cancelled', lastUpdatedAt: new Date() } }
-      );
-
-      const updatedRuns = await Run.find({ schedulerOrderId });
-      return res.json({
-        success: true,
-        status: 'cancelled',
-        completedRuns: updatedRuns.filter(r => r.status === 'completed').length,
-        runStatuses: updatedRuns.map(r => r.status),
+        type: 'run_failed',
+        severity: 'critical',
+        title: lockedRun.label + ' run failed',
+        message: lockedRun.label + ' run (qty: ' + lockedRun.quantity + ') failed: ' + errorMsg,
+        schedulerOrderId: lockedRun.schedulerOrderId,
+        runId: run._id.toString(),
+        label: lockedRun.label,
       });
     }
 
@@ -792,45 +781,7 @@ mongoose.connection.once('open', () => {
     }
   }, 10000);
 });
-          status: 'processing',
-          executedAt: null,
-          lockedAt: { $lt: new Date(Date.now() - 25 * 60 * 1000) }, // 25 minutes for views
-        });
-
-        for (const stuckRun of stuckProcessingRuns) {
-          await createNotification({
-            type: 'run_stuck',
-            severity: 'warning',
-            title: `${stuckRun.label} run stuck in processing`,
-            message: `${stuckRun.label} run (qty: ${stuckRun.quantity}) has been processing for over 25 minutes without completing.`,
-            schedulerOrderId: stuckRun.schedulerOrderId,
-            runId: stuckRun._id.toString(),
-            label: stuckRun.label,
-          });
-        }
-
-        const stuckQueuedRuns = await Run.find({
-          status: 'queued',
-          lockedAt: { $lt: new Date(Date.now() - 10 * 60 * 1000) }, // 10 minutes
-        });
-
-        for (const stuckRun of stuckQueuedRuns) {
-          await createNotification({
-            type: 'run_stuck_queued',
-            severity: 'warning',
-            title: `${stuckRun.label} run stuck in queue`,
-            message: `${stuckRun.label} run (qty: ${stuckRun.quantity}) has been queued for over 10 minutes without execution.`,
-            schedulerOrderId: stuckRun.schedulerOrderId,
-            runId: stuckRun._id.toString(),
-            label: stuckRun.label,
-          });
-        }
-      } catch (notifErr) {
-        console.error('[SCHEDULER] Notification check error:', notifErr.message);
-      }
-
-  }, 10000);
-});
+          
 
 /* =========================
    API ENDPOINTS
@@ -1007,14 +958,24 @@ app.post('/api/order/control', async (req, res) => {
         return run.schedulerOrderId !== schedulerOrderId;
       });
 
-            // 🔥 NOTIFICATION: Order cancelled
+                  // 🔥 NOTIFICATION: Order cancelled
       await createNotification({
         type: 'order_cancelled',
         severity: 'info',
-        title: `Order cancelled`,
-        message: `Order ${schedulerOrderId} was manually cancelled`,
-        schedulerOrderId,
+        title: 'Order cancelled',
+        message: 'Order ' + schedulerOrderId + ' was manually cancelled',
+        schedulerOrderId: schedulerOrderId,
       });
+
+      await Order.updateOne(
+        { schedulerOrderId },
+        { $set: { status: 'cancelled', lastUpdatedAt: new Date() } }
+      );
+
+      const updatedRuns = await Run.find({ schedulerOrderId });
+      return res.json({
+        success: true,
+        status: 'cancelled',
         completedRuns: updatedRuns.filter(r => r.status === 'completed').length,
         runStatuses: updatedRuns.map(r => r.status),
       });
