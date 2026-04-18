@@ -363,7 +363,34 @@ async function executeRun(run, tickId) {
       return;
     }
 
-    console.log(`[${lockedRun.label}] Executing run #${lockedRun.id}, quantity: ${lockedRun.quantity}`);
+        console.log(`[${lockedRun.label}] Executing run #${lockedRun.id}, quantity: ${lockedRun.quantity}`);
+
+    // 🔥 SAFETY: Enforce minimum quantities per service type
+    // Prevents provider rejection due to quantity below their minimum
+    const MINIMUM_QUANTITIES = {
+      VIEWS: 100,
+      LIKES: 10,
+      SHARES: 10,
+      SAVES: 10,
+      COMMENTS: 5,
+    };
+
+    const minQty = MINIMUM_QUANTITIES[lockedRun.label] || 1;
+    if (lockedRun.quantity < minQty) {
+      console.log(`[${lockedRun.label}] SKIP: quantity ${lockedRun.quantity} is below minimum ${minQty}`);
+      await Run.findOneAndUpdate(
+        { _id: run._id, status: 'processing' },
+        {
+          $set: {
+            status: 'failed',
+            error: `Quantity ${lockedRun.quantity} is below minimum ${minQty} for ${lockedRun.label}`,
+            done: true,
+          }
+        }
+      );
+      await updateOrderStatus(lockedRun.schedulerOrderId);
+      return;
+    }
 
     let payload = {
       apiUrl: lockedRun.apiUrl,
