@@ -423,8 +423,10 @@ async function executeRun(run, tickId) {
       return;
     }
 
-    // =========================================================
-    // 🔥 STEP 4: SELF-HEALING — Check previous run for same service + same link
+        // =========================================================
+    // 🔥 STEP 4: CHECK PREVIOUS ORDER STATUS (INFO ONLY — always execute)
+    // Just checks and logs the status for notification purposes
+    // Does NOT wait, cancel, or skip — always proceeds to execute
     // =========================================================
     const previousRun = await Run.findOne({
       link: lockedRun.link,
@@ -436,8 +438,6 @@ async function executeRun(run, tickId) {
     }).sort({ executedAt: -1 });
 
     if (previousRun && previousRun.smmOrderId) {
-      console.log(`[${lockedRun.label}] Checking previous provider order #${previousRun.smmOrderId}...`);
-
       const providerStatus = await checkSingleProviderStatus(
         previousRun.apiUrl,
         previousRun.apiKey,
@@ -446,150 +446,21 @@ async function executeRun(run, tickId) {
 
       console.log(`[${lockedRun.label}] Previous order #${previousRun.smmOrderId} status: ${providerStatus}`);
 
-      const isStuck = providerStatus === 'In progress' || providerStatus === 'Partial' || providerStatus === 'Pending' || providerStatus === 'Processing';
+      // 🔥 Only notify if previous order is still active (for awareness)
+      // But we ALWAYS continue to execute the current run regardless
+      const isStillActive = providerStatus === 'In progress' || providerStatus === 'Partial' || providerStatus === 'Pending' || providerStatus === 'Processing';
 
-      if (isStuck) {
-        if (lockedRun.label === 'VIEWS') {
-          // 🔥 VIEWS: Wait 20 minutes then cancel and execute
-          console.log(`[VIEWS] Previous order stuck at "${providerStatus}". Waiting 20 minutes...`);
-
-          await createNotification({
-            type: 'run_waiting',
-            severity: 'warning',
-            title: 'VIEWS run waiting for previous order',
-            message: `Previous VIEWS order #${previousRun.smmOrderId} is "${providerStatus}". Waiting 20 minutes before proceeding.`,
-            schedulerOrderId: lockedRun.schedulerOrderId,
-            label: lockedRun.label,
-            smmOrderId: previousRun.smmOrderId,
-          });
-
-          // Reset to pending with 20 minute delay
-          await Run.updateOne(
-            { _id: lockedRun._id },
-            {
-              $set: {
-                status: 'pending',
-                time: new Date(Date.now() + 20 * 60 * 1000),
-                executionLock: null,
-                claimedByTick: null,
-                lockedAt: null,
-                error: `Waiting: previous order #${previousRun.smmOrderId} is ${providerStatus}. Will retry at ${new Date(Date.now() + 20 * 60 * 1000).toISOString()}`,
-              }
-            }
-          );
-
-          // Schedule the cancel + execute after 20 minutes using setTimeout
-          setTimeout(async () => {
-            try {
-              console.log(`[VIEWS] 20 min elapsed. Checking status of #${previousRun.smmOrderId} again...`);
-
-              const statusNow = await checkSingleProviderStatus(
-                previousRun.apiUrl,
-                previousRun.apiKey,
-                previousRun.smmOrderId
-              );
-
-              console.log(`[VIEWS] Status after 20 min: ${statusNow}`);
-
-              // Always cancel if still stuck, regardless of current status
-              const stillStuck = statusNow === 'In progress' || statusNow === 'Partial' || statusNow === 'Pending' || statusNow === 'Processing';
-
-              if (stillStuck) {
-                console.log(`[VIEWS] Still stuck. Cancelling #${previousRun.smmOrderId}...`);
-                const cancelResult = await cancelProviderOrder(previousRun.apiUrl, previousRun.apiKey, previousRun.smmOrderId);
-                console.log(`[VIEWS] Cancel result:`, cancelResult);
-
-                if (!cancelResult.success) {
-                  // Cancel failed — skip this run (Choice 1: Safe Skip)
-                  console.log(`[VIEWS] Cancel failed. Skipping run to avoid overlap.`);
-                  await Run.updateOne(
-                    { _id: lockedRun._id },
-                    { $set: { status: 'failed', done: true, error: `Skipped: could not cancel previous stuck order #${previousRun.smmOrderId}. Cancel error: ${cancelResult.error}` } }
-                  );
-                  await createNotification({
-                    type: 'run_skipped',
-                    severity: 'critical',
-                    title: 'VIEWS run skipped — cancel failed',
-                    message: `Could not cancel stuck order #${previousRun.smmOrderId} (${cancelResult.error}). Run skipped to protect link.`,
-                    schedulerOrderId: lockedRun.schedulerOrderId,
-                    label: 'VIEWS',
-                    smmOrderId: previousRun.smmOrderId,
-                  });
-                  await updateOrderStatus(lockedRun.schedulerOrderId);
-                  return;
-                }
-
-                await createNotification({
-                  type: 'provider_auto_cancelled',
-                  severity: 'info',
-                  title: 'Stuck VIEWS order auto-cancelled',
-                  message: `Order #${previousRun.smmOrderId} was stuck. Auto-cancelled successfully. Next run now executing.`,
-                  schedulerOrderId: lockedRun.schedulerOrderId,
-                  label: 'VIEWS',
-                  smmOrderId: previousRun.smmOrderId,
-                });
-              } else {
-                console.log(`[VIEWS] Previous order resolved to "${statusNow}". Proceeding with next run.`);
-              }
-
-              // Now execute the run (reset to pending so scheduler picks it up normally)
-              await Run.updateOne(
-                { _id: lockedRun._id },
-                { $set: { status: 'pending', time: new Date(), executionLock: null, claimedByTick: null, lockedAt: null, error: null } }
-              );
-
-            } catch (err) {
-              console.error('[VIEWS] Error in 20-min timeout handler:', err.message);
-              // Reset to pending anyway so scheduler retries
-              await Run.updateOne(
-                { _id: lockedRun._id },
-                { $set: { status: 'pending', time: new Date(), executionLock: null, claimedByTick: null, lockedAt: null } }
-              );
-            }
-          }, 20 * 60 * 1000); // 20 minutes
-
-          return; // Exit executeRun — setTimeout will handle the rest
-
-        } else {
-          // 🔥 LIKES / SHARES / SAVES / COMMENTS: Cancel immediately and execute
-          console.log(`[${lockedRun.label}] Previous order #${previousRun.smmOrderId} stuck at "${providerStatus}". Cancelling immediately...`);
-
-          const cancelResult = await cancelProviderOrder(previousRun.apiUrl, previousRun.apiKey, previousRun.smmOrderId);
-          console.log(`[${lockedRun.label}] Cancel result:`, cancelResult);
-
-          if (!cancelResult.success) {
-            // Cancel failed — skip this run (Choice 1: Safe Skip)
-            console.log(`[${lockedRun.label}] Cancel failed. Skipping run to avoid overlap.`);
-            await Run.findOneAndUpdate(
-              { _id: run._id, status: 'processing' },
-              { $set: { status: 'failed', done: true, error: `Skipped: could not cancel previous stuck order #${previousRun.smmOrderId}. Error: ${cancelResult.error}` } }
-            );
-            await createNotification({
-              type: 'run_skipped',
-              severity: 'warning',
-              title: `${lockedRun.label} run skipped — cancel failed`,
-              message: `Could not cancel stuck order #${previousRun.smmOrderId} (${cancelResult.error}). Run skipped to protect link.`,
-              schedulerOrderId: lockedRun.schedulerOrderId,
-              label: lockedRun.label,
-              smmOrderId: previousRun.smmOrderId,
-            });
-            await updateOrderStatus(lockedRun.schedulerOrderId);
-            return;
-          }
-
-          await createNotification({
-            type: 'provider_auto_cancelled',
-            severity: 'info',
-            title: `Stuck ${lockedRun.label} order auto-cancelled`,
-            message: `Order #${previousRun.smmOrderId} was stuck at "${providerStatus}". Auto-cancelled. Proceeding with next run.`,
-            schedulerOrderId: lockedRun.schedulerOrderId,
-            label: lockedRun.label,
-            smmOrderId: previousRun.smmOrderId,
-          });
-
-          // Wait 3 seconds for provider to process the cancel
-          await new Promise(resolve => setTimeout(resolve, 3000));
-        }
+      if (isStillActive) {
+        console.log(`[${lockedRun.label}] Previous order still active (${providerStatus}) — executing next run anyway`);
+        await createNotification({
+          type: 'run_overlap_info',
+          severity: 'info',
+          title: `${lockedRun.label} overlap detected`,
+          message: `Previous ${lockedRun.label} order #${previousRun.smmOrderId} is still "${providerStatus}" but next run is executing anyway as per policy.`,
+          schedulerOrderId: lockedRun.schedulerOrderId,
+          label: lockedRun.label,
+          smmOrderId: previousRun.smmOrderId,
+        });
       }
     }
     // =========================================================
