@@ -1630,6 +1630,27 @@ app.delete('/api/notifications/clear', async (req, res) => {
   }
 });
 
+/* =========================
+   🔥 MEMORY USAGE ENDPOINT
+========================= */
+app.get('/api/memory-usage', (req, res) => {
+  const mem = process.memoryUsage();
+  const usedMB = Math.round(mem.rss / 1024 / 1024);
+  const heapUsedMB = Math.round(mem.heapUsed / 1024 / 1024);
+  const heapTotalMB = Math.round(mem.heapTotal / 1024 / 1024);
+  const totalMB = 512; // Render free tier limit
+  const usagePercent = Math.round((usedMB / totalMB) * 100);
+
+  return res.json({
+    usedMB,
+    totalMB,
+    usagePercent,
+    heapUsedMB,
+    heapTotalMB,
+    status: usagePercent > 85 ? 'critical' : usagePercent > 65 ? 'warning' : 'healthy',
+  });
+});
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`========================================`);
   console.log(`Server running on port ${PORT}`);
