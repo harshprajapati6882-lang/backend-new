@@ -1629,7 +1629,46 @@ app.delete('/api/notifications/clear', async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 });
+/* =========================
+   🔥 MONGODB STORAGE CHECK
+========================= */
+app.get('/api/db-stats', async (req, res) => {
+  try {
+    const db = mongoose.connection.db;
 
+    // Get database stats
+    const dbStats = await db.stats();
+
+    const dataStorageMB = Math.round((dbStats.dataSize / 1024 / 1024) * 100) / 100;
+    const storageOnDiskMB = Math.round((dbStats.storageSize / 1024 / 1024) * 100) / 100;
+    const indexSizeMB = Math.round((dbStats.indexSize / 1024 / 1024) * 100) / 100;
+    const totalUsedMB = Math.round((dataStorageMB + indexSizeMB) * 100) / 100;
+    const totalLimitMB = 512;
+    const usagePercent = Math.round((totalUsedMB / totalLimitMB) * 100);
+
+    // Get collection counts
+    const runCount = await mongoose.connection.db.collection('runs').countDocuments();
+    const orderCount = await mongoose.connection.db.collection('orders').countDocuments();
+    const notifCount = await mongoose.connection.db.collection('notifications').countDocuments();
+
+    return res.json({
+      dataStorageMB,
+      storageOnDiskMB,
+      indexSizeMB,
+      totalUsedMB,
+      totalLimitMB,
+      usagePercent,
+      status: usagePercent > 85 ? 'critical' : usagePercent > 65 ? 'warning' : 'healthy',
+      collections: {
+        runs: runCount,
+        orders: orderCount,
+        notifications: notifCount,
+      }
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
 /* =========================
    🔥 MEMORY USAGE ENDPOINT
 ========================= */
