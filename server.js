@@ -437,14 +437,29 @@ async function executeRun(run, tickId) {
       // closest to (but before) this engagement run's original time
       const thisRunTime = lockedRun.originalScheduledTime || lockedRun.time;
 
-      const correspondingViewsRun = await Run.findOne({
+            const correspondingViewsRun = await Run.findOne({
         schedulerOrderId: lockedRun.schedulerOrderId,
         label: 'VIEWS',
-        // Views run should be scheduled within 20 minutes BEFORE this run
-        time: {
-          $gte: new Date(thisRunTime.getTime() - 20 * 60 * 1000),
-          $lte: thisRunTime,
-        },
+        // 🔥 FIX: Find VIEWS run whose originalScheduledTime OR time
+        // is within 20 minutes BEFORE this engagement run's original time
+        // This correctly links engagement runs to their corresponding VIEWS run
+        $or: [
+          // Match by originalScheduledTime (most accurate when runs have been rescheduled)
+          {
+            originalScheduledTime: {
+              $gte: new Date(thisRunTime.getTime() - 20 * 60 * 1000),
+              $lte: new Date(thisRunTime.getTime() + 1 * 60 * 1000),
+            }
+          },
+          // Fallback: match by current time field
+          {
+            originalScheduledTime: null,
+            time: {
+              $gte: new Date(thisRunTime.getTime() - 20 * 60 * 1000),
+              $lte: new Date(thisRunTime.getTime() + 1 * 60 * 1000),
+            }
+          }
+        ]
       }).sort({ time: -1 });
 
       if (correspondingViewsRun) {
