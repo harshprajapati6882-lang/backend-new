@@ -49,8 +49,12 @@ const RunSchema = new mongoose.Schema({
   // 🔥 Execution lock fields
   executionLock: { type: String, default: null },
   lockedAt: { type: Date, default: null },
-  // 🔥 NEW: Track which scheduler tick claimed this run
+    // 🔥 NEW: Track which scheduler tick claimed this run
   claimedByTick: { type: String, default: null },
+  // 🔥 NEW: Retry tracking for "active order" rejections
+  retryCount: { type: Number, default: 0 },
+  originalScheduledTime: { type: Date, default: null },
+  actualExecutedAt: { type: Date, default: null },
 });
 
 // 🔥 COMPOUND INDEXES for atomic operations
@@ -424,9 +428,7 @@ async function executeRun(run, tickId) {
     }
 
         // =========================================================
-    // 🔥 STEP 4: CHECK PREVIOUS ORDER STATUS (INFO ONLY — always execute)
-    // Just checks and logs the status for notification purposes
-    // Does NOT wait, cancel, or skip — always proceeds to execute
+    // 🔥 STEP 4: CHECK PREVIOUS ORDER STATUS (log only)
     // =========================================================
     const previousRun = await Run.findOne({
       link: lockedRun.link,
@@ -443,26 +445,216 @@ async function executeRun(run, tickId) {
         previousRun.apiKey,
         previousRun.smmOrderId
       );
-
       console.log(`[${lockedRun.label}] Previous order #${previousRun.smmOrderId} status: ${providerStatus}`);
+    }
+    // =========================================================
 
-      // 🔥 Only notify if previous order is still active (for awareness)
-      // But we ALWAYS continue to execute the current run regardless
-      const isStillActive = providerStatus === 'In progress' || providerStatus === 'Partial' || providerStatus === 'Pending' || providerStatus === 'Processing';
+    // 🔥 STEP 5: Place the order
+    console.log(`[${lockedRun.label}] Executing run #${lockedRun.id}, quantity: ${lockedRun.quantity}`);
 
-      if (isStillActive) {
-        console.log(`[${lockedRun.label}] Previous order still active (${providerStatus}) — executing next run anyway`);
+    let payload = {
+      apiUrl: lockedRun.apiUrl,
+      apiKey: lockedRun.apiKey,
+      service: lockedRun.service,
+      link: lockedRun.link,
+    };
+
+    if (lockedRun.label === 'COMMENTS') {
+      payload.comments = lockedRun.comments;
+      payload.quantity = lockedRun.quantity;
+    } else {
+      payload.quantity = lockedRun.quantity;
+    }
+
+    const result = await placeOrder(payload);
+
+    if (result?.order) {
+      console.log(`[${lockedRun.label}] SUCCESS - SMM Order ID: ${result.order}`);
+      const completed = await Run.findOneAndUpdate(
+        { _id: run._id, status: 'processing' },
+        {
+          $set: {
+            done: true,
+            status: 'completed',
+            smmOrderId: result.order,
+            executedAt: new Date(),
+            actualExecutedAt: new Date(),
+          }
+        },
+        { new: true }
+      );
+      if (!completed) {
+        console.warn(`[${lockedRun.label}] WARNING: Run completed but status update failed`);
+      }
+    } else {
+      console.error(`[${lockedRun.label}] FAILED`, result);
+      const errorMsg = result?.error || 'Unknown error';
+
+      // 🔥 Is this an "active order" rejection from provider?
+      const isActiveOrderError = errorMsg.toLowerCase().includes('active order') ||
+        errorMsg.toLowerCase().includes('please wait');
+
+      if (isActiveOrderError) {
+        const currentRetryCount = lockedRun.retryCount || 0;
+        const MAX_RETRIES = 6; // 6 × 5 min = 30 min max
+
+        if (currentRetryCount < MAX_RETRIES) {
+          // 🔥 Reschedule +5 minutes and retry
+          const retryTime = new Date(Date.now() + 5 * 60 * 1000);
+          console.log(`[${lockedRun.label}] Active order conflict. Retry ${currentRetryCount + 1}/${MAX_RETRIES} at ${retryTime.toISOString()}`);
+
+          await Run.findOneAndUpdate(
+            { _id: run._id, status: 'processing' },
+            {
+              $set: {
+                status: 'pending',
+                time: retryTime,
+                executionLock: null,
+                claimedByTick: null,
+                lockedAt: null,
+                retryCount: currentRetryCount + 1,
+                originalScheduledTime: currentRetryCount === 0 ? lockedRun.time : lockedRun.originalScheduledTime,
+                error: `Retry ${currentRetryCount + 1}/${MAX_RETRIES}: Provider has active order for this link. Retrying at ${retryTime.toISOString()}`,
+              }
+            }
+          );
+
+          await createNotification({
+            type: 'run_retrying',
+            severity: 'warning',
+            title: `${lockedRun.label} run rescheduled`,
+            message: `${lockedRun.label} run retry ${currentRetryCount + 1}/${MAX_RETRIES}. Provider has active order for this link. Next attempt at ${retryTime.toLocaleTimeString()}.`,
+            schedulerOrderId: lockedRun.schedulerOrderId,
+            runId: run._id.toString(),
+            label: lockedRun.label,
+          });
+
+          // Return early — run is still alive as pending
+          return;
+
+        } else {
+          // 🔥 MAX RETRIES REACHED — check actual provider status
+          console.log(`[${lockedRun.label}] Max retries (${MAX_RETRIES}) reached. Checking provider status...`);
+
+          const previousRunForForce = await Run.findOne({
+            link: lockedRun.link,
+            label: lockedRun.label,
+            schedulerOrderId: lockedRun.schedulerOrderId,
+            status: 'completed',
+            smmOrderId: { $ne: null },
+            _id: { $ne: lockedRun._id },
+          }).sort({ executedAt: -1 });
+
+          if (previousRunForForce && previousRunForForce.smmOrderId) {
+            const statusNow = await checkSingleProviderStatus(
+              previousRunForForce.apiUrl,
+              previousRunForForce.apiKey,
+              previousRunForForce.smmOrderId
+            );
+
+            console.log(`[${lockedRun.label}] Status after max retries: ${statusNow}`);
+
+            // 🔥 Partial/Completed/Cancelled = link is FREE (provider gave up)
+            const isLinkFree = statusNow === 'Partial' || statusNow === 'Completed' || statusNow === 'Cancelled';
+            const isStillBlocked = statusNow === 'In progress' || statusNow === 'Processing' || statusNow === 'Pending';
+
+            if (isLinkFree) {
+              // Link is free — retry in 30 seconds
+              console.log(`[${lockedRun.label}] Previous order is "${statusNow}" — link is free. Retrying in 30 sec.`);
+              const immediateRetry = new Date(Date.now() + 30 * 1000);
+              await Run.findOneAndUpdate(
+                { _id: run._id, status: 'processing' },
+                {
+                  $set: {
+                    status: 'pending',
+                    time: immediateRetry,
+                    executionLock: null,
+                    claimedByTick: null,
+                    lockedAt: null,
+                    retryCount: 0,
+                    error: null,
+                  }
+                }
+              );
+              return;
+
+            } else if (isStillBlocked) {
+              // Still blocked after 30 min — give up
+              console.log(`[${lockedRun.label}] Still blocked after ${MAX_RETRIES} retries. Marking as failed.`);
+              await Run.findOneAndUpdate(
+                { _id: run._id, status: 'processing' },
+                {
+                  $set: {
+                    status: 'failed',
+                    error: `Max retries (${MAX_RETRIES}) reached. Previous order #${previousRunForForce.smmOrderId} still "${statusNow}" after 30 min.`,
+                    done: true,
+                  }
+                }
+              );
+              await createNotification({
+                type: 'run_failed',
+                severity: 'critical',
+                title: `${lockedRun.label} run failed after max retries`,
+                message: `${lockedRun.label} run waited 30 min but previous order #${previousRunForForce.smmOrderId} is still "${statusNow}". Run marked as failed.`,
+                schedulerOrderId: lockedRun.schedulerOrderId,
+                runId: run._id.toString(),
+                label: lockedRun.label,
+                smmOrderId: previousRunForForce.smmOrderId,
+              });
+
+            } else {
+              // Unknown status — retry in 30 seconds as safe fallback
+              const fallbackRetry = new Date(Date.now() + 30 * 1000);
+              await Run.findOneAndUpdate(
+                { _id: run._id, status: 'processing' },
+                {
+                  $set: {
+                    status: 'pending',
+                    time: fallbackRetry,
+                    executionLock: null,
+                    claimedByTick: null,
+                    lockedAt: null,
+                    retryCount: 0,
+                    error: null,
+                  }
+                }
+              );
+              return;
+            }
+          } else {
+            // No previous run found — just fail
+            await Run.findOneAndUpdate(
+              { _id: run._id, status: 'processing' },
+              { $set: { status: 'failed', error: errorMsg, done: true } }
+            );
+            await createNotification({
+              type: 'run_failed',
+              severity: 'critical',
+              title: lockedRun.label + ' run failed',
+              message: lockedRun.label + ' run failed: ' + errorMsg,
+              schedulerOrderId: lockedRun.schedulerOrderId,
+              runId: run._id.toString(),
+              label: lockedRun.label,
+            });
+          }
+        }
+      } else {
+        // 🔥 Normal failure (not active order conflict)
+        await Run.findOneAndUpdate(
+          { _id: run._id, status: 'processing' },
+          { $set: { status: 'failed', error: errorMsg, done: true } }
+        );
         await createNotification({
-          type: 'run_overlap_info',
-          severity: 'info',
-          title: `${lockedRun.label} overlap detected`,
-          message: `Previous ${lockedRun.label} order #${previousRun.smmOrderId} is still "${providerStatus}" but next run is executing anyway as per policy.`,
+          type: 'run_failed',
+          severity: 'critical',
+          title: lockedRun.label + ' run failed',
+          message: lockedRun.label + ' run (qty: ' + lockedRun.quantity + ') failed: ' + errorMsg,
           schedulerOrderId: lockedRun.schedulerOrderId,
+          runId: run._id.toString(),
           label: lockedRun.label,
-          smmOrderId: previousRun.smmOrderId,
         });
       }
-    }
+    }    }
     // =========================================================
 
     // 🔥 STEP 5: Place the order
@@ -1161,13 +1353,14 @@ app.get('/api/order/runs/:schedulerOrderId', async (req, res) => {
         smmOrderId: r.smmOrderId,
         executedAt: r.executedAt,
         error: r.error,
-        done: r.done || false,
+                done: r.done || false,
         cancelled: r.status === 'cancelled',
         lastError: r.error || "",
-        retryCount: 0,
-        originalTime: r.time ? r.time.toISOString() : "",
+        retryCount: r.retryCount || 0,
+        originalTime: r.originalScheduledTime ? r.originalScheduledTime.toISOString() : (r.time ? r.time.toISOString() : ""),
         currentTime: r.time ? r.time.toISOString() : "",
-        retryReason: "",
+        actualExecutedAt: r.actualExecutedAt ? r.actualExecutedAt.toISOString() : null,
+        retryReason: r.retryCount > 0 ? `Retried ${r.retryCount} time(s) due to active order conflict` : "",
       })),
     });
   } catch (error) {
