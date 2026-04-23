@@ -653,55 +653,7 @@ async function executeRun(run, tickId) {
           runId: run._id.toString(),
           label: lockedRun.label,
         });
-      }
-    }    }
-    // =========================================================
-
-    // 🔥 STEP 5: Place the order
-    console.log(`[${lockedRun.label}] Executing run #${lockedRun.id}, quantity: ${lockedRun.quantity}`);
-
-    let payload = {
-      apiUrl: lockedRun.apiUrl,
-      apiKey: lockedRun.apiKey,
-      service: lockedRun.service,
-      link: lockedRun.link,
-    };
-
-    if (lockedRun.label === 'COMMENTS') {
-      payload.comments = lockedRun.comments;
-      payload.quantity = lockedRun.quantity;
-    } else {
-      payload.quantity = lockedRun.quantity;
-    }
-
-    const result = await placeOrder(payload);
-
-    if (result?.order) {
-      console.log(`[${lockedRun.label}] SUCCESS - SMM Order ID: ${result.order}`);
-      const completed = await Run.findOneAndUpdate(
-        { _id: run._id, status: 'processing' },
-        { $set: { done: true, status: 'completed', smmOrderId: result.order, executedAt: new Date() } },
-        { new: true }
-      );
-      if (!completed) {
-        console.warn(`[${lockedRun.label}] WARNING: Run completed but status update failed`);
-      }
-    } else {
-      console.error(`[${lockedRun.label}] FAILED`, result);
-      const errorMsg = result?.error || 'Unknown error';
-      await Run.findOneAndUpdate(
-        { _id: run._id, status: 'processing' },
-        { $set: { status: 'failed', error: errorMsg, done: true } }
-      );
-      await createNotification({
-        type: 'run_failed',
-        severity: 'critical',
-        title: lockedRun.label + ' run failed',
-        message: lockedRun.label + ' run (qty: ' + lockedRun.quantity + ') failed: ' + errorMsg,
-        schedulerOrderId: lockedRun.schedulerOrderId,
-        runId: run._id.toString(),
-        label: lockedRun.label,
-      });
+            }
     }
 
   } catch (err) {
