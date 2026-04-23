@@ -427,6 +427,82 @@ async function executeRun(run, tickId) {
       return;
     }
 
+         // =========================================================
+    // 🔥 STEP 3.5: For LIKES/SHARES/SAVES/COMMENTS
+    // Check if VIEWS run for the same time slot is completed first
+    // If VIEWS is still pending/retrying, postpone this run too
+    // =========================================================
+    if (lockedRun.label !== 'VIEWS') {
+      // Find the VIEWS run for this same order that was scheduled
+      // closest to (but before) this engagement run's original time
+      const thisRunTime = lockedRun.originalScheduledTime || lockedRun.time;
+
+      const correspondingViewsRun = await Run.findOne({
+        schedulerOrderId: lockedRun.schedulerOrderId,
+        label: 'VIEWS',
+        // Views run should be scheduled within 20 minutes BEFORE this run
+        time: {
+          $gte: new Date(thisRunTime.getTime() - 20 * 60 * 1000),
+          $lte: thisRunTime,
+        },
+      }).sort({ time: -1 });
+
+      if (correspondingViewsRun) {
+        const viewsStatus = correspondingViewsRun.status;
+
+        // If VIEWS run is still pending/queued/processing (retrying or waiting)
+        const viewsNotDoneYet = viewsStatus === 'pending' || viewsStatus === 'queued' || viewsStatus === 'processing';
+
+        if (viewsNotDoneYet) {
+          console.log(`[${lockedRun.label}] VIEWS run for this slot is still "${viewsStatus}". Postponing ${lockedRun.label} by 5 min...`);
+
+          const postponeTime = new Date(Date.now() + 5 * 60 * 1000);
+          await Run.findOneAndUpdate(
+            { _id: run._id, status: 'processing' },
+            {
+              $set: {
+                status: 'pending',
+                time: postponeTime,
+                executionLock: null,
+                claimedByTick: null,
+                lockedAt: null,
+                originalScheduledTime: lockedRun.originalScheduledTime || lockedRun.time,
+                error: `Waiting for VIEWS run to complete first. VIEWS status: ${viewsStatus}. Retrying at ${postponeTime.toISOString()}`,
+              }
+            }
+          );
+
+          return; // Exit — will retry in 5 min
+        }
+
+        // VIEWS completed — check if it completed successfully
+        if (viewsStatus === 'failed') {
+          console.log(`[${lockedRun.label}] VIEWS run for this slot FAILED. Proceeding with ${lockedRun.label} anyway.`);
+          // Still proceed — better to place likes even if views failed
+        }
+
+        if (viewsStatus === 'cancelled') {
+          console.log(`[${lockedRun.label}] VIEWS run for this slot was CANCELLED. Skipping ${lockedRun.label}.`);
+          await Run.findOneAndUpdate(
+            { _id: run._id, status: 'processing' },
+            {
+              $set: {
+                status: 'cancelled',
+                done: true,
+                error: 'Skipped: VIEWS run for this slot was cancelled.',
+              }
+            }
+          );
+          await updateOrderStatus(lockedRun.schedulerOrderId);
+          return;
+        }
+
+        // VIEWS is completed — safe to proceed
+        console.log(`[${lockedRun.label}] VIEWS run completed. Proceeding with ${lockedRun.label}.`);
+      }
+    }
+    // =========================================================
+
         // =========================================================
     // 🔥 STEP 4: CHECK PREVIOUS ORDER STATUS (log only)
     // =========================================================
