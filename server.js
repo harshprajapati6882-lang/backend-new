@@ -1736,6 +1736,128 @@ app.delete('/api/notifications/clear', async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 });
+
+/* =========================
+   🔥 DUPLICATE DETECTION ENDPOINT
+========================= */
+app.get('/api/check-duplicates', async (req, res) => {
+  try {
+    // Get all orders
+    const allOrders = await Order.find({ status: { $ne: 'cancelled' } });
+    const duplicates = [];
+
+    for (const order of allOrders) {
+      const runs = await Run.find({ schedulerOrderId: order.schedulerOrderId });
+
+      // Count completed runs per label
+      const completedCounts = {};
+      const totalCounts = {};
+
+      runs.forEach(r => {
+        const label = r.label;
+        if (!totalCounts[label]) totalCounts[label] = 0;
+        totalCounts[label]++;
+
+        if (r.status === 'completed' && r.smmOrderId) {
+          if (!completedCounts[label]) completedCounts[label] = 0;
+          completedCounts[label]++;
+        }
+      });
+
+      // Check for duplicates: completed count should never exceed total count
+      // Also check if multiple completed runs have different smmOrderIds for same time slot
+      const smmOrdersByLabel = {};
+      runs.forEach(r => {
+        if (r.status === 'completed' && r.smmOrderId) {
+          const label = r.label;
+          if (!smmOrdersByLabel[label]) smmOrdersByLabel[label] = [];
+          smmOrdersByLabel[label].push({
+            smmOrderId: r.smmOrderId,
+            quantity: r.quantity,
+            executedAt: r.executedAt,
+            time: r.time,
+          });
+        }
+      });
+
+      // Detect: same label has more completed runs than expected
+      for (const label of Object.keys(completedCounts)) {
+        const completed = completedCounts[label];
+        const total = totalCounts[label];
+
+        // If completed > total, something is wrong
+        if (completed > total) {
+          duplicates.push({
+            schedulerOrderId: order.schedulerOrderId,
+            orderName: order.name,
+            link: order.link,
+            label: label,
+            expectedRuns: total,
+            actualCompleted: completed,
+            type: 'over_completed',
+            smmOrders: smmOrdersByLabel[label] || [],
+          });
+        }
+      }
+
+      // Also detect: same smmOrderId used twice (exact duplicate placement)
+      for (const label of Object.keys(smmOrdersByLabel)) {
+        const orders_list = smmOrdersByLabel[label];
+        const smmIds = orders_list.map(o => o.smmOrderId);
+        const uniqueSmmIds = [...new Set(smmIds)];
+
+        if (uniqueSmmIds.length < smmIds.length) {
+          // Found duplicate smmOrderId
+          const duplicatedIds = smmIds.filter((id, i) => smmIds.indexOf(id) !== i);
+          duplicates.push({
+            schedulerOrderId: order.schedulerOrderId,
+            orderName: order.name,
+            link: order.link,
+            label: label,
+            type: 'duplicate_smm_id',
+            duplicatedSmmOrderIds: [...new Set(duplicatedIds)],
+            allSmmOrders: orders_list,
+          });
+        }
+      }
+
+      // Detect: two completed runs of same label within 2 minutes of each other (suspicious)
+      for (const label of Object.keys(smmOrdersByLabel)) {
+        const sortedRuns = smmOrdersByLabel[label]
+          .filter(r => r.executedAt)
+          .sort((a, b) => new Date(a.executedAt).getTime() - new Date(b.executedAt).getTime());
+
+        for (let i = 1; i < sortedRuns.length; i++) {
+          const prev = new Date(sortedRuns[i - 1].executedAt).getTime();
+          const curr = new Date(sortedRuns[i].executedAt).getTime();
+          const diffMin = (curr - prev) / 60000;
+
+          if (diffMin < 2 && sortedRuns[i].smmOrderId !== sortedRuns[i - 1].smmOrderId) {
+            duplicates.push({
+              schedulerOrderId: order.schedulerOrderId,
+              orderName: order.name,
+              link: order.link,
+              label: label,
+              type: 'rapid_double_execution',
+              timeBetweenMin: Math.round(diffMin * 10) / 10,
+              run1: sortedRuns[i - 1],
+              run2: sortedRuns[i],
+            });
+          }
+        }
+      }
+    }
+
+    return res.json({
+      scannedOrders: allOrders.length,
+      duplicatesFound: duplicates.length,
+      hasDuplicates: duplicates.length > 0,
+      duplicates: duplicates,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
 /* =========================
    🔥 MONGODB STORAGE CHECK
 ========================= */
