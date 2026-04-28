@@ -594,6 +594,17 @@ async function executeRun(run, tickId) {
           const retryTime = new Date(Date.now() + 5 * 60 * 1000);
           console.log(`[${lockedRun.label}] Active order conflict. Retry ${currentRetryCount + 1}/${MAX_RETRIES} at ${retryTime.toISOString()}`);
 
+                    // 🔥 FIX: Check if order was cancelled before rescheduling
+          const orderCheckBeforeRetry = await Order.findOne({ schedulerOrderId: lockedRun.schedulerOrderId });
+          if (!orderCheckBeforeRetry || orderCheckBeforeRetry.status === 'cancelled') {
+            console.log(`[${lockedRun.label}] Order cancelled — not rescheduling retry.`);
+            await Run.findOneAndUpdate(
+              { _id: run._id, status: 'processing' },
+              { $set: { status: 'cancelled', done: true } }
+            );
+            return;
+          }
+
           await Run.findOneAndUpdate(
             { _id: run._id, status: 'processing' },
             {
@@ -649,9 +660,14 @@ async function executeRun(run, tickId) {
             const isLinkFree = statusNow === 'Partial' || statusNow === 'Completed' || statusNow === 'Cancelled';
             const isStillBlocked = statusNow === 'In progress' || statusNow === 'Processing' || statusNow === 'Pending';
 
-            if (isLinkFree) {
-              // Link is free — retry in 30 seconds
+                       if (isLinkFree) {
               console.log(`[${lockedRun.label}] Previous order is "${statusNow}" — link is free. Retrying in 30 sec.`);
+              // 🔥 FIX: Check cancellation before retry
+              const orderCheckFree = await Order.findOne({ schedulerOrderId: lockedRun.schedulerOrderId });
+              if (!orderCheckFree || orderCheckFree.status === 'cancelled') {
+                await Run.findOneAndUpdate({ _id: run._id, status: 'processing' }, { $set: { status: 'cancelled', done: true } });
+                return;
+              }
               const immediateRetry = new Date(Date.now() + 30 * 1000);
               await Run.findOneAndUpdate(
                 { _id: run._id, status: 'processing' },
@@ -693,8 +709,14 @@ async function executeRun(run, tickId) {
                 smmOrderId: previousRunForForce.smmOrderId,
               });
 
-            } else {
+                       } else {
               // Unknown status — retry in 30 seconds as safe fallback
+              // 🔥 FIX: Check cancellation before retry
+              const orderCheckFallback = await Order.findOne({ schedulerOrderId: lockedRun.schedulerOrderId });
+              if (!orderCheckFallback || orderCheckFallback.status === 'cancelled') {
+                await Run.findOneAndUpdate({ _id: run._id, status: 'processing' }, { $set: { status: 'cancelled', done: true } });
+                return;
+              }
               const fallbackRetry = new Date(Date.now() + 30 * 1000);
               await Run.findOneAndUpdate(
                 { _id: run._id, status: 'processing' },
@@ -792,7 +814,7 @@ async function updateOrderStatus(schedulerOrderId) {
     let newStatus;
     if (order.status === 'cancelled') {
       newStatus = 'cancelled'; // 🔥 Don't override manual cancellation
-    } else if (completedRuns + failedRuns + cancelledRuns === totalRuns) {
+        } else if (completedRuns + failedRuns + cancelledRuns === totalRuns) {
       // All runs are done (one way or another)
       if (completedRuns === totalRuns) {
         newStatus = 'completed';
@@ -800,8 +822,11 @@ async function updateOrderStatus(schedulerOrderId) {
         newStatus = 'failed';
       } else if (cancelledRuns === totalRuns) {
         newStatus = 'cancelled';
+      } else if (cancelledRuns > 0 && completedRuns > 0) {
+        // 🔥 FIX: Mix of completed + cancelled = completed (not running)
+        newStatus = 'completed';
       } else {
-        newStatus = 'completed'; // Mix of completed/failed/cancelled = completed
+        newStatus = 'completed';
       }
     } else if (processingRuns > 0 || queuedRuns > 0 || completedRuns > 0) {
       newStatus = 'running';
@@ -1254,10 +1279,10 @@ app.post('/api/order/control', async (req, res) => {
 
     if (action === 'cancel') {
       // 🔥 Bulk cancel all non-completed runs
-      await Run.updateMany(
+            await Run.updateMany(
         {
           schedulerOrderId,
-          status: { $in: ['pending', 'processing', 'queued'] }
+          status: { $in: ['pending', 'processing', 'queued', 'paused'] }
         },
         { $set: { status: 'cancelled', done: true, executionLock: null, claimedByTick: null } }
       );
