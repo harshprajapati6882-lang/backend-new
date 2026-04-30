@@ -286,12 +286,16 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
 
       console.log(`[ADD RUN] ${label} qty=${quantity} | base=${new Date(baseTime).toISOString()} | delay=${Math.round(delay / 60000)}min | actual=${staggeredTime.toISOString()}`);
 
+            // 🔥 Use per-service API if provided, otherwise fall back to baseConfig
+      const serviceApiUrl = serviceConfig.apiUrl || baseConfig.apiUrl;
+      const serviceApiKey = serviceConfig.apiKey || baseConfig.apiKey;
+
       const runData = new Run({
         id: Date.now() + Math.random(),
         schedulerOrderId,
         label,
-        apiUrl: baseConfig.apiUrl,
-        apiKey: baseConfig.apiKey,
+        apiUrl: serviceApiUrl,
+        apiKey: serviceApiKey,
         service: serviceConfig.serviceId,
         link: baseConfig.link,
         quantity: quantity,
