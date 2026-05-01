@@ -165,8 +165,13 @@ async function placeOrder({ apiUrl, apiKey, service, link, quantity, comments })
 
   const response = await axios.post(apiUrl, params.toString(), {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    timeout: 30000, // 🔥 NEW: 30 second timeout
+    timeout: 45000, // 🔥 Increased to 45 seconds
   });
+
+  // 🔥 Handle HTML error responses (502 Bad Gateway pages)
+  if (typeof response.data === 'string' && response.data.includes('<html')) {
+    throw new Error(`HTTP ${response.status} Bad Gateway`);
+  }
 
   return response.data;
 }
@@ -755,8 +760,68 @@ async function executeRun(run, tickId) {
             });
           }
         }
-      } else {
-        // 🔥 Normal failure (not active order conflict)
+            } else {
+        // 🔥 Check if this is a retryable provider error (502/503/504/timeout/network)
+        const isRetryableError =
+          errorMsg.includes('502') ||
+          errorMsg.includes('503') ||
+          errorMsg.includes('504') ||
+          errorMsg.toLowerCase().includes('timeout') ||
+          errorMsg.toLowerCase().includes('econnreset') ||
+          errorMsg.toLowerCase().includes('econnrefused') ||
+          errorMsg.toLowerCase().includes('network') ||
+          errorMsg.toLowerCase().includes('bad gateway') ||
+          errorMsg.toLowerCase().includes('service unavailable');
+
+        if (isRetryableError) {
+          const currentRetryCount = lockedRun.retryCount || 0;
+          const MAX_RETRIES = 4; // 4 × 5 min = 20 min max for provider errors
+
+          if (currentRetryCount < MAX_RETRIES) {
+            const retryTime = new Date(Date.now() + 5 * 60 * 1000);
+            console.log(`[${lockedRun.label}] Provider error (${errorMsg.slice(0, 50)}). Retry ${currentRetryCount + 1}/${MAX_RETRIES} at ${retryTime.toISOString()}`);
+
+            // Check if order was cancelled before rescheduling
+            const orderCheckRetry = await Order.findOne({ schedulerOrderId: lockedRun.schedulerOrderId });
+            if (!orderCheckRetry || orderCheckRetry.status === 'cancelled') {
+              await Run.findOneAndUpdate(
+                { _id: run._id, status: 'processing' },
+                { $set: { status: 'cancelled', done: true } }
+              );
+              return;
+            }
+
+            await Run.findOneAndUpdate(
+              { _id: run._id, status: 'processing' },
+              {
+                $set: {
+                  status: 'pending',
+                  time: retryTime,
+                  executionLock: null,
+                  claimedByTick: null,
+                  lockedAt: null,
+                  retryCount: currentRetryCount + 1,
+                  originalScheduledTime: currentRetryCount === 0 ? lockedRun.time : lockedRun.originalScheduledTime,
+                  error: `Retry ${currentRetryCount + 1}/${MAX_RETRIES}: Provider error - ${errorMsg.slice(0, 100)}. Retrying at ${retryTime.toISOString()}`,
+                }
+              }
+            );
+
+            await createNotification({
+              type: 'run_retrying',
+              severity: 'warning',
+              title: `${lockedRun.label} run rescheduled (provider error)`,
+              message: `${lockedRun.label} run retry ${currentRetryCount + 1}/${MAX_RETRIES}. Provider returned: ${errorMsg.slice(0, 80)}. Next attempt at ${retryTime.toLocaleTimeString()}.`,
+              schedulerOrderId: lockedRun.schedulerOrderId,
+              runId: run._id.toString(),
+              label: lockedRun.label,
+            });
+
+            return; // Don't mark as failed — will retry
+          }
+        }
+
+        // 🔥 Normal failure (not retryable or max retries reached)
         await Run.findOneAndUpdate(
           { _id: run._id, status: 'processing' },
           { $set: { status: 'failed', error: errorMsg, done: true } }
@@ -770,23 +835,91 @@ async function executeRun(run, tickId) {
           runId: run._id.toString(),
           label: lockedRun.label,
         });
-            }
+      }
     }
 
-  } catch (err) {
+    } catch (err) {
     console.error(`[${run.label}] ERROR`, err.response?.data || err.message);
-    const errorMsg = err.response?.data?.error || err.message;
+
+    // 🔥 Build error message — handle HTML responses (502 pages)
+    let errorMsg = err.message;
+    if (err.response?.data) {
+      if (typeof err.response.data === 'string' && err.response.data.includes('<html')) {
+        errorMsg = `HTTP ${err.response.status} Bad Gateway`;
+      } else {
+        errorMsg = err.response.data?.error || err.response.data || err.message;
+      }
+    }
+
+    // 🔥 Check if retryable network/provider error
+    const isRetryableNetworkError =
+      err.code === 'ECONNABORTED' ||
+      err.code === 'ECONNRESET' ||
+      err.code === 'ECONNREFUSED' ||
+      err.code === 'ETIMEDOUT' ||
+      err.message?.toLowerCase().includes('timeout') ||
+      (err.response?.status >= 500 && err.response?.status <= 599);
+
+    if (isRetryableNetworkError && run?._id) {
+      const currentRetryCount = run.retryCount || 0;
+      const MAX_RETRIES = 4;
+
+      if (currentRetryCount < MAX_RETRIES) {
+        const retryTime = new Date(Date.now() + 5 * 60 * 1000);
+        console.log(`[${run.label}] Network error, retry ${currentRetryCount + 1}/${MAX_RETRIES} at ${retryTime.toISOString()}`);
+
+        // Check if order was cancelled
+        const orderCheck = await Order.findOne({ schedulerOrderId: run.schedulerOrderId });
+        if (!orderCheck || orderCheck.status === 'cancelled') {
+          await Run.findOneAndUpdate(
+            { _id: run._id, status: 'processing' },
+            { $set: { status: 'cancelled', done: true } }
+          );
+          return;
+        }
+
+        await Run.findOneAndUpdate(
+          { _id: run._id, status: 'processing' },
+          {
+            $set: {
+              status: 'pending',
+              time: retryTime,
+              executionLock: null,
+              claimedByTick: null,
+              lockedAt: null,
+              retryCount: currentRetryCount + 1,
+              originalScheduledTime: currentRetryCount === 0 ? run.time : run.originalScheduledTime,
+              error: `Retry ${currentRetryCount + 1}/${MAX_RETRIES}: ${errorMsg}. Retrying at ${retryTime.toISOString()}`,
+            }
+          }
+        );
+
+        await createNotification({
+          type: 'run_retrying',
+          severity: 'warning',
+          title: `${run.label} run rescheduled (network error)`,
+          message: `${run.label} run retry ${currentRetryCount + 1}/${MAX_RETRIES}. Error: ${errorMsg}. Next attempt at ${retryTime.toLocaleTimeString()}.`,
+          schedulerOrderId: run.schedulerOrderId,
+          runId: run?._id?.toString(),
+          label: run.label,
+        });
+
+        return; // Will retry — don't fall through to failed
+      }
+    }
+
+    // Not retryable or max retries reached — mark as failed
     if (run?._id) {
       await Run.findOneAndUpdate(
         { _id: run._id, status: 'processing' },
-        { $set: { status: 'failed', error: errorMsg, done: true } }
+        { $set: { status: 'failed', error: String(errorMsg), done: true } }
       );
     }
     await createNotification({
       type: 'run_error',
       severity: 'critical',
       title: `${run.label} run error`,
-      message: `${run.label} run (qty: ${run.quantity}) threw error: ${errorMsg}`,
+      message: `${run.label} run (qty: ${run.quantity}) failed after retries: ${errorMsg}`,
       schedulerOrderId: run.schedulerOrderId,
       runId: run?._id?.toString(),
       label: run.label,
