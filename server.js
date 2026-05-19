@@ -140,12 +140,14 @@ let likesQueue = [];
 let sharesQueue = [];
 let savesQueue = [];
 let commentsQueue = [];
+let repostsQueue = [];
 
 let isExecutingViews = false;
 let isExecutingLikes = false;
 let isExecutingShares = false;
 let isExecutingSaves = false;
 let isExecutingComments = false;
+let isExecutingReposts = false;
 
 /* =========================
    PLACE ORDER
@@ -246,8 +248,10 @@ function getServiceDelay(label) {
       return (8 + Math.random() * 4) * 60 * 1000;  // 8-12 minutes
     case 'SAVES':
       return (10 + Math.random() * 5) * 60 * 1000; // 10-15 minutes
-    case 'COMMENTS':
+        case 'COMMENTS':
       return (12 + Math.random() * 6) * 60 * 1000; // 12-18 minutes
+    case 'REPOSTS':
+      return (5 + Math.random() * 5) * 60 * 1000; // 5-10 minutes
     default:
       return 0;
   }
@@ -1073,6 +1077,9 @@ function processSavesQueue() {
 function processCommentsQueue() {
   processQueue('COMMENTS', commentsQueue, () => isExecutingComments, (v) => { isExecutingComments = v; });
 }
+function processRepostsQueue() {
+  processQueue('REPOSTS', repostsQueue, () => isExecutingReposts, (v) => { isExecutingReposts = v; });
+}
 
 /* =========================
    🔥 FIX 7: MAIN SCHEDULER (BULLETPROOF)
@@ -1125,7 +1132,7 @@ mongoose.connection.once('open', () => {
 
     try {
       const now = new Date();
-      let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0 };
+      let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0, reposts: 0 };
 
       // 🔥 FIX: Use MongoDB atomic findOneAndUpdate in a loop
       // Instead of find() then update(), we claim runs one-by-one atomically
@@ -1183,9 +1190,12 @@ mongoose.connection.once('open', () => {
         } else if (claimedRun.label === 'SAVES') {
           savesQueue.push(queueItem);
           addedToQueue.saves++;
-        } else if (claimedRun.label === 'COMMENTS') {
+               } else if (claimedRun.label === 'COMMENTS') {
           commentsQueue.push(queueItem);
           addedToQueue.comments++;
+        } else if (claimedRun.label === 'REPOSTS') {
+          repostsQueue.push(queueItem);
+          addedToQueue.reposts++;
         }
 
         claimedCount++;
@@ -1194,7 +1204,7 @@ mongoose.connection.once('open', () => {
 
       const totalAdded = addedToQueue.views + addedToQueue.likes + addedToQueue.shares + addedToQueue.saves + addedToQueue.comments;
       if (totalAdded > 0) {
-        console.log(`[SCHEDULER] [${tickId}] Claimed ${totalAdded} runs - Views: ${addedToQueue.views}, Likes: ${addedToQueue.likes}, Shares: ${addedToQueue.shares}, Saves: ${addedToQueue.saves}, Comments: ${addedToQueue.comments}`);
+               console.log(`[SCHEDULER] [${tickId}] Claimed ${totalAdded} runs - Views: ${addedToQueue.views}, Likes: ${addedToQueue.likes}, Shares: ${addedToQueue.shares}, Saves: ${addedToQueue.saves}, Comments: ${addedToQueue.comments}, Reposts: ${addedToQueue.reposts}`);
       }
 
       // 🔥 Start processors if needed
@@ -1203,6 +1213,7 @@ mongoose.connection.once('open', () => {
       if (sharesQueue.length > 0 && !isExecutingShares) processSharesQueue();
       if (savesQueue.length > 0 && !isExecutingSaves) processSavesQueue();
       if (commentsQueue.length > 0 && !isExecutingComments) processCommentsQueue();
+      if (repostsQueue.length > 0 && !isExecutingReposts) processRepostsQueue();
 
             } catch (error) {
       console.error('[SCHEDULER] Error:', error);
@@ -1441,7 +1452,11 @@ app.post('/api/order/control', async (req, res) => {
         const run = item.run || item;
         return run.schedulerOrderId !== schedulerOrderId;
       });
-      commentsQueue = commentsQueue.filter(item => {
+           commentsQueue = commentsQueue.filter(item => {
+        const run = item.run || item;
+        return run.schedulerOrderId !== schedulerOrderId;
+      });
+      repostsQueue = repostsQueue.filter(item => {
         const run = item.run || item;
         return run.schedulerOrderId !== schedulerOrderId;
       });
@@ -1495,7 +1510,11 @@ app.post('/api/order/control', async (req, res) => {
         const run = item.run || item;
         return run.schedulerOrderId !== schedulerOrderId;
       });
-      commentsQueue = commentsQueue.filter(item => {
+          commentsQueue = commentsQueue.filter(item => {
+        const run = item.run || item;
+        return run.schedulerOrderId !== schedulerOrderId;
+      });
+      repostsQueue = repostsQueue.filter(item => {
         const run = item.run || item;
         return run.schedulerOrderId !== schedulerOrderId;
       });
@@ -1605,9 +1624,13 @@ app.get('/api/queues/status', (req, res) => {
       queueLength: savesQueue.length,
       isExecuting: isExecutingSaves,
     },
-    comments: {
+       comments: {
       queueLength: commentsQueue.length,
       isExecuting: isExecutingComments,
+    },
+    reposts: {
+      queueLength: repostsQueue.length,
+      isExecuting: isExecutingReposts,
     },
     scheduler: {
       isRunning: isSchedulerRunning,
@@ -1692,6 +1715,7 @@ app.post('/api/scheduler/trigger', async (req, res) => {
       else if (label === 'SHARES') { sharesQueue.push(queueItem); addedToQueue.shares++; }
       else if (label === 'SAVES') { savesQueue.push(queueItem); addedToQueue.saves++; }
       else if (label === 'COMMENTS') { commentsQueue.push(queueItem); addedToQueue.comments++; }
+      else if (label === 'REPOSTS') { repostsQueue.push(queueItem); addedToQueue.reposts++; }
 
       claimedCount++;
     }
@@ -2085,7 +2109,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`========================================`);
   console.log(`Server running on port ${PORT}`);
   console.log(`Minimum views per run: ${MIN_VIEWS_PER_RUN}`);
-  console.log(`5 Queue system: VIEWS | LIKES | SHARES | SAVES | COMMENTS`);
+  console.log(`6 Queue system: VIEWS | LIKES | SHARES | SAVES | COMMENTS | REPOSTS`);
   console.log(`Scheduler runs every 10 seconds`);
   console.log(`🔒 Bulletproof atomic execution locks ENABLED`);
   console.log(`🔒 Scheduler mutex ENABLED`);
