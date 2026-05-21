@@ -55,6 +55,8 @@ const RunSchema = new mongoose.Schema({
   retryCount: { type: Number, default: 0 },
   originalScheduledTime: { type: Date, default: null },
   actualExecutedAt: { type: Date, default: null },
+  // 🔥 NEW: Per-service minimum quantity from the SMM panel
+  serviceMin: { type: Number, default: null },
 });
 
 // 🔥 COMPOUND INDEXES for atomic operations
@@ -303,7 +305,7 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
       const serviceApiUrl = serviceConfig.apiUrl || baseConfig.apiUrl;
       const serviceApiKey = serviceConfig.apiKey || baseConfig.apiKey;
 
-      const runData = new Run({
+          const runData = new Run({
         id: Date.now() + Math.random(),
         schedulerOrderId,
         label,
@@ -323,6 +325,7 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
         executionLock: null,
         lockedAt: null,
         claimedByTick: null,
+        serviceMin: serviceConfig.serviceMin || null, // 🔥 Store per-service minimum
       });
 
       await runData.save();
@@ -431,14 +434,14 @@ async function executeRun(run, tickId) {
       return;
     }
 
-    // 🔥 STEP 3: Minimum quantity safety check
-    const MINIMUM_QUANTITIES = { VIEWS: 100, LIKES: 10, SHARES: 10, SAVES: 10, COMMENTS: 5 };
-    const minQty = MINIMUM_QUANTITIES[lockedRun.label] || 1;
-    if (lockedRun.quantity < minQty) {
-      console.log(`[${lockedRun.label}] SKIP: quantity ${lockedRun.quantity} below minimum ${minQty}`);
+        // 🔥 STEP 3: Minimum quantity safety check — use per-run stored minimum if available
+    const FALLBACK_MINIMUMS = { VIEWS: 100, LIKES: 10, SHARES: 10, SAVES: 10, COMMENTS: 10, REPOSTS: 10 };
+    const serviceMin = lockedRun.serviceMin || FALLBACK_MINIMUMS[lockedRun.label] || 1;
+    if (lockedRun.quantity < serviceMin) {
+      console.log(`[${lockedRun.label}] SKIP: quantity ${lockedRun.quantity} below service minimum ${serviceMin}`);
       await Run.findOneAndUpdate(
         { _id: run._id, status: 'processing' },
-        { $set: { status: 'failed', error: `Quantity ${lockedRun.quantity} is below minimum ${minQty} for ${lockedRun.label}`, done: true } }
+        { $set: { status: 'failed', error: `Quantity ${lockedRun.quantity} is below minimum ${serviceMin} for ${lockedRun.label}`, done: true } }
       );
       await updateOrderStatus(lockedRun.schedulerOrderId);
       return;
