@@ -236,22 +236,26 @@ async function checkSingleProviderStatus(apiUrl, apiKey, smmOrderId) {
    This makes engagement look organic — views first, then reactions follow naturally
 ========================= */
 function getServiceDelay(label) {
-  // Returns delay in milliseconds
-  // Views always at T+0
-  // Other services get random delay within their range
+  // 🔥 Wider, more organic delay ranges
+  // Some users react in seconds, some in hours — this mimics that spread
   switch (label) {
     case 'VIEWS':
       return 0;
     case 'LIKES':
-      return (3 + Math.random() * 4) * 60 * 1000;  // 3-7 minutes
+      // 2-90 minutes: some likes come fast, some come much later
+      return (2 + Math.random() * 88) * 60 * 1000;
     case 'SHARES':
-      return (8 + Math.random() * 4) * 60 * 1000;  // 8-12 minutes
+      // 5-120 minutes: shares are rarer and more spread out
+      return (5 + Math.random() * 115) * 60 * 1000;
     case 'SAVES':
-      return (10 + Math.random() * 5) * 60 * 1000; // 10-15 minutes
-        case 'COMMENTS':
-      return (12 + Math.random() * 6) * 60 * 1000; // 12-18 minutes
+      // 3-150 minutes: saves happen at unpredictable times
+      return (3 + Math.random() * 147) * 60 * 1000;
+    case 'COMMENTS':
+      // 8-180 minutes: comments take longest — people think before commenting
+      return (8 + Math.random() * 172) * 60 * 1000;
     case 'REPOSTS':
-      return (5 + Math.random() * 5) * 60 * 1000; // 5-10 minutes
+      // 5-90 minutes
+      return (5 + Math.random() * 85) * 60 * 1000;
     default:
       return 0;
   }
@@ -509,20 +513,12 @@ async function executeRun(run, tickId) {
           // Still proceed — better to place likes even if views failed
         }
 
-        if (viewsStatus === 'cancelled') {
-          console.log(`[${lockedRun.label}] VIEWS run for this slot was CANCELLED. Skipping ${lockedRun.label}.`);
-          await Run.findOneAndUpdate(
-            { _id: run._id, status: 'processing' },
-            {
-              $set: {
-                status: 'cancelled',
-                done: true,
-                error: 'Skipped: VIEWS run for this slot was cancelled.',
-              }
-            }
-          );
-          await updateOrderStatus(lockedRun.schedulerOrderId);
-          return;
+                if (viewsStatus === 'cancelled') {
+          // 🔥 Don't auto-cancel engagement. If user explicitly cancelled the order,
+          // the order-level check already handles it. If VIEWS was provider-cancelled,
+          // engagement should still be placed — it's a separate service.
+          console.log(`[${lockedRun.label}] VIEWS run for this slot was cancelled. Proceeding with ${lockedRun.label} anyway (separate service).`);
+          // Fall through to normal execution — do NOT cancel engagement
         }
 
         // VIEWS is completed — safe to proceed
@@ -1140,11 +1136,15 @@ mongoose.connection.once('open', () => {
       const MAX_CLAIMS_PER_TICK = 50; // Safety limit
 
       while (claimedCount < MAX_CLAIMS_PER_TICK) {
-        // 🔥 Atomically find AND claim ONE pending run
+               // 🔥 Atomically find AND claim ONE pending run
+        // Skip quiet hours (2 AM - 5 AM server time) — no real organic traffic at 3 AM
+        const currentHour = now.getHours();
+        const isQuietHours = currentHour >= 2 && currentHour < 5;
+        
         const claimedRun = await Run.findOneAndUpdate(
           {
             status: 'pending',
-            time: { $lte: now },
+            time: { $lte: isQuietHours ? new Date(now.getTime() - 3 * 60 * 60 * 1000) : now },
             executionLock: null,
             claimedByTick: null,
           },
@@ -1165,9 +1165,20 @@ mongoose.connection.once('open', () => {
         // No more pending runs to claim
         if (!claimedRun) break;
 
-        // 🔥 Verify order isn't cancelled before adding to queue
+               // 🔥 Verify order exists before adding to queue
         const order = await Order.findOne({ schedulerOrderId: claimedRun.schedulerOrderId });
-        if (!order || order.status === 'cancelled') {
+        if (!order) {
+          // ⚠️ Order not found — DON'T cancel. Reset run so it retries next tick.
+          // MongoDB might have had a momentary hiccup. Cancelling permanently is too aggressive.
+          console.log(`[SCHEDULER] Order not found for ${claimedRun.schedulerOrderId} — resetting run, will retry`);
+          await Run.updateOne(
+            { _id: claimedRun._id },
+            { $set: { status: 'pending', executionLock: null, lockedAt: null, claimedByTick: null } }
+          );
+          continue;
+        }
+        if (order.status === 'cancelled') {
+          // Only cancel if order is EXPLICITLY cancelled by user
           await Run.updateOne(
             { _id: claimedRun._id },
             { $set: { status: 'cancelled', done: true } }
