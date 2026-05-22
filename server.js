@@ -283,9 +283,9 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
           .split('\n')
           .map(c => c.trim())
           .filter(c => c.length > 0);
-        if (lines.length < 5) continue;
-        if (lines.length > 10) {
-          lines = lines.sort(() => Math.random() - 0.5).slice(0, 10);
+        if (lines.length < 10) continue;
+        if (lines.length > 15) {
+          lines = lines.sort(() => Math.random() - 0.5).slice(0, 15);
         }
         run.comments = lines.join('\n');
         quantity = lines.length;
