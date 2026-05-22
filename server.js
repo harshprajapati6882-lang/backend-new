@@ -1140,15 +1140,13 @@ mongoose.connection.once('open', () => {
       const MAX_CLAIMS_PER_TICK = 50; // Safety limit
 
       while (claimedCount < MAX_CLAIMS_PER_TICK) {
-               // 🔥 Atomically find AND claim ONE pending run
-        // Skip quiet hours (2 AM - 5 AM server time) — no real organic traffic at 3 AM
-        const currentHour = now.getHours();
-        const isQuietHours = currentHour >= 2 && currentHour < 5;
-        
+               // 🔥 Atomically find AND claim ONE pending run.
+        // Free Render instances can sleep; when they wake, immediately catch up
+        // every overdue run instead of waiting for a "quiet hours" window to pass.
         const claimedRun = await Run.findOneAndUpdate(
           {
             status: 'pending',
-            time: { $lte: isQuietHours ? new Date(now.getTime() - 3 * 60 * 60 * 1000) : now },
+            time: { $lte: now },
             executionLock: null,
             claimedByTick: null,
           },
@@ -1217,7 +1215,7 @@ mongoose.connection.once('open', () => {
         console.log(`[SCHEDULER] Claimed ${claimedRun.label} run (qty: ${claimedRun.quantity}) [${tickId}]`);
       }
 
-      const totalAdded = addedToQueue.views + addedToQueue.likes + addedToQueue.shares + addedToQueue.saves + addedToQueue.comments;
+      const totalAdded = addedToQueue.views + addedToQueue.likes + addedToQueue.shares + addedToQueue.saves + addedToQueue.comments + addedToQueue.reposts;
       if (totalAdded > 0) {
                console.log(`[SCHEDULER] [${tickId}] Claimed ${totalAdded} runs - Views: ${addedToQueue.views}, Likes: ${addedToQueue.likes}, Shares: ${addedToQueue.shares}, Saves: ${addedToQueue.saves}, Comments: ${addedToQueue.comments}, Reposts: ${addedToQueue.reposts}`);
       }
@@ -1278,6 +1276,13 @@ mongoose.connection.once('open', () => {
   }, 10000);
 });
           
+
+/* =========================
+   HEALTH CHECK (for free-tier uptime monitors)
+========================= */
+app.get('/', (req, res) => {
+  res.json({ ok: true, service: 'smm-scheduler', time: new Date().toISOString() });
+});
 
 /* =========================
    API ENDPOINTS
@@ -1763,9 +1768,12 @@ app.post('/api/scheduler/trigger', async (req, res) => {
 ========================= */
 setInterval(async () => {
   try {
-    await axios.get("https://backend-new-6tzb.onrender.com");
-    console.log("[PING] Keeping server alive");
-  } catch (e) {}
+    const keepAliveUrl = process.env.KEEP_ALIVE_URL || "https://backend-new-6tzb.onrender.com/";
+    await axios.get(keepAliveUrl, { timeout: 15000 });
+    console.log("[PING] Keep-alive OK");
+  } catch (e) {
+    console.log("[PING] Keep-alive skipped/failed");
+  }
 }, 5 * 60 * 1000);
 
 /* =========================
