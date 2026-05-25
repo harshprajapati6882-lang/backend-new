@@ -953,9 +953,15 @@ async function updateOrderStatus(schedulerOrderId) {
     const cancelledRuns = orderRuns.filter(r => r.status === 'cancelled').length;
 
     let newStatus;
+    // 🔥 FIX Issue-2: Manually cancelled orders ALWAYS stay cancelled,
+    // even if a run that was mid-processing finishes and calls updateOrderStatus.
+    // We check this FIRST before any other logic.
     if (order.status === 'cancelled') {
-      newStatus = 'cancelled'; // 🔥 Don't override manual cancellation
-        } else if (completedRuns + failedRuns + cancelledRuns === totalRuns) {
+      newStatus = 'cancelled';
+    } else if (order.status === 'paused') {
+      // Paused orders stay paused until resumed — don't flip back to running.
+      newStatus = 'paused';
+    } else if (completedRuns + failedRuns + cancelledRuns === totalRuns) {
       // All runs are done (one way or another)
       if (completedRuns === totalRuns) {
         newStatus = 'completed';
@@ -964,7 +970,6 @@ async function updateOrderStatus(schedulerOrderId) {
       } else if (cancelledRuns === totalRuns) {
         newStatus = 'cancelled';
       } else if (cancelledRuns > 0 && completedRuns > 0) {
-        // 🔥 FIX: Mix of completed + cancelled = completed (not running)
         newStatus = 'completed';
       } else {
         newStatus = 'completed';
@@ -1296,6 +1301,21 @@ app.post('/api/order', async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
+    // 🔥 FIX Issue-1: Block new orders on the same link if an active order exists.
+    // "Active" means pending / running / processing / paused.
+    // Cancelled, completed, and failed orders do NOT block new ones.
+    const existingActive = await Order.findOne({
+      link,
+      status: { $in: ['pending', 'running', 'processing', 'paused'] },
+    });
+    if (existingActive) {
+      return res.status(409).json({
+        error: `An active order already exists for this link (ID: ${existingActive.schedulerOrderId}, status: ${existingActive.status}). Cancel or wait for it to complete before placing a new order on the same link.`,
+        activeOrderId: existingActive.schedulerOrderId,
+        activeOrderStatus: existingActive.status,
+      });
+    }
+
     console.log('Creating new order...');
 
     const schedulerOrderId = `sched-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -1446,11 +1466,13 @@ app.post('/api/order/control', async (req, res) => {
     }
 
     if (action === 'cancel') {
-      // 🔥 Bulk cancel all non-completed runs
-            await Run.updateMany(
+      // 🔥 FIX Issue-2: Cancel ALL non-completed, non-failed runs including 'retrying'.
+      // 'retrying' runs would otherwise re-queue on the next scheduler tick and
+      // bring the order back to 'running'.
+      await Run.updateMany(
         {
           schedulerOrderId,
-          status: { $in: ['pending', 'processing', 'queued', 'paused'] }
+          status: { $in: ['pending', 'processing', 'queued', 'paused', 'retrying'] }
         },
         { $set: { status: 'cancelled', done: true, executionLock: null, claimedByTick: null } }
       );
@@ -2126,6 +2148,86 @@ app.get('/api/memory-usage', (req, res) => {
     heapTotalMB,
     status: usagePercent > 85 ? 'critical' : usagePercent > 65 ? 'warning' : 'healthy',
   });
+});
+
+/* =========================
+   🔥 BULK CANCEL ENDPOINT
+   Cancel multiple orders in a single request.
+   Works for orders in ANY status — the frontend sends whatever
+   schedulerOrderIds the user has selected.
+========================= */
+app.post('/api/orders/bulk-cancel', async (req, res) => {
+  try {
+    const { schedulerOrderIds } = req.body;
+    if (!Array.isArray(schedulerOrderIds) || schedulerOrderIds.length === 0) {
+      return res.status(400).json({ error: 'schedulerOrderIds must be a non-empty array' });
+    }
+
+    const results = [];
+
+    for (const schedulerOrderId of schedulerOrderIds) {
+      try {
+        const order = await Order.findOne({ schedulerOrderId });
+        if (!order) {
+          results.push({ schedulerOrderId, success: false, error: 'Order not found' });
+          continue;
+        }
+
+        // Cancel ALL non-done runs (including retrying)
+        await Run.updateMany(
+          {
+            schedulerOrderId,
+            status: { $in: ['pending', 'processing', 'queued', 'paused', 'retrying'] }
+          },
+          { $set: { status: 'cancelled', done: true, executionLock: null, claimedByTick: null } }
+        );
+
+        // Flush in-memory queues for this order
+        const flushQueue = q => q.filter(item => (item.run || item).schedulerOrderId !== schedulerOrderId);
+        viewsQueue    = flushQueue(viewsQueue);
+        likesQueue    = flushQueue(likesQueue);
+        sharesQueue   = flushQueue(sharesQueue);
+        savesQueue    = flushQueue(savesQueue);
+        commentsQueue = flushQueue(commentsQueue);
+        repostsQueue  = flushQueue(repostsQueue);
+
+        await Order.updateOne(
+          { schedulerOrderId },
+          { $set: { status: 'cancelled', lastUpdatedAt: new Date() } }
+        );
+
+        await createNotification({
+          type: 'order_cancelled',
+          severity: 'info',
+          title: 'Order bulk-cancelled',
+          message: `Order ${schedulerOrderId} was cancelled via bulk action`,
+          schedulerOrderId,
+        });
+
+        const updatedRuns = await Run.find({ schedulerOrderId });
+        results.push({
+          schedulerOrderId,
+          success: true,
+          status: 'cancelled',
+          completedRuns: updatedRuns.filter(r => r.status === 'completed').length,
+          runStatuses: updatedRuns.map(r => r.status),
+        });
+      } catch (err) {
+        results.push({ schedulerOrderId, success: false, error: err.message });
+      }
+    }
+
+    const successCount = results.filter(r => r.success).length;
+    return res.json({
+      success: true,
+      total: schedulerOrderIds.length,
+      cancelled: successCount,
+      failed: schedulerOrderIds.length - successCount,
+      results,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
 });
 
 app.listen(PORT, '0.0.0.0', () => {
