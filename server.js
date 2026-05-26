@@ -8,8 +8,28 @@ mongoose.set('bufferCommands', false);
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-app.use(cors());
-app.use(express.json());
+// ── Restricted CORS ──────────────────────────────────────────────
+// Only allow requests from the Vercel frontend and localhost dev.
+// Set CORS_ORIGIN env var on Render to your exact Vercel URL.
+// Multiple origins: comma-separated e.g. "https://a.vercel.app,https://b.vercel.app"
+const ALLOWED_ORIGINS = (() => {
+  const raw = process.env.CORS_ORIGIN || 'https://iambatman-topaz.vercel.app';
+  return raw.split(',').map(o => o.trim()).filter(Boolean);
+})();
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (Render health checks, curl, UptimeRobot)
+    if (!origin) return callback(null, true);
+    // Allow any localhost port for development
+    if (/^https?:\/\/localhost(:\d+)?$/.test(origin)) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    console.warn(`[CORS] Blocked origin: ${origin}`);
+    callback(new Error(`CORS: origin ${origin} not allowed`));
+  },
+  credentials: true,
+}));
+app.use(express.json({ limit: '2mb' }));
 
 /* =========================
    🔥 MONGODB CONNECTION
@@ -108,6 +128,13 @@ const NotificationSchema = new mongoose.Schema({
 NotificationSchema.index({ createdAt: -1 });
 NotificationSchema.index({ read: 1, createdAt: -1 });
 
+// ── Settings schema — persists server settings across restarts ──
+const SettingsSchema = new mongoose.Schema({
+  key:   { type: String, required: true, unique: true },
+  value: { type: mongoose.Schema.Types.Mixed, required: true },
+});
+const Settings = mongoose.model('Settings', SettingsSchema);
+
 const Run = mongoose.model('Run', RunSchema);
 const Order = mongoose.model('Order', OrderSchema);
 const Notification = mongoose.model('Notification', NotificationSchema);
@@ -138,8 +165,35 @@ async function createNotification({ type, severity, title, message, schedulerOrd
 
 /* =========================
    MINIMUM VIEWS PER RUN
+   Loaded from MongoDB on startup so it survives Render restarts.
 ========================= */
 let MIN_VIEWS_PER_RUN = 100;
+
+async function loadMinViewsSetting() {
+  try {
+    const doc = await Settings.findOne({ key: 'minViewsPerRun' });
+    if (doc && typeof doc.value === 'number' && doc.value >= 1) {
+      MIN_VIEWS_PER_RUN = Math.floor(doc.value);
+      console.log(`[SETTINGS] Loaded minViewsPerRun = ${MIN_VIEWS_PER_RUN} from DB`);
+    } else {
+      console.log(`[SETTINGS] No saved minViewsPerRun — using default ${MIN_VIEWS_PER_RUN}`);
+    }
+  } catch (err) {
+    console.warn('[SETTINGS] Could not load minViewsPerRun:', err.message);
+  }
+}
+
+async function saveMinViewsSetting(value) {
+  try {
+    await Settings.findOneAndUpdate(
+      { key: 'minViewsPerRun' },
+      { value },
+      { upsert: true, new: true }
+    );
+  } catch (err) {
+    console.warn('[SETTINGS] Could not save minViewsPerRun:', err.message);
+  }
+}
 
 /* =========================
    🔥 FIX 1: SCHEDULER LOCK
@@ -148,6 +202,7 @@ let MIN_VIEWS_PER_RUN = 100;
 let isSchedulerRunning = false;
 let schedulerTickId = 0;
 let schedulerLastTickStarted = 0; // epoch ms when last tick began
+let lastNotificationPruneTime = 0; // epoch ms — prune runs once every 6 hours
 
 // Watchdog: if scheduler mutex is stuck for > 60 s, force-release it
 setInterval(() => {
@@ -1150,8 +1205,10 @@ function processRepostsQueue() {
 mongoose.connection.once('open', () => {
   console.log("🚀 Scheduler started after DB connected");
 
-  // 🔥 STARTUP: Clean up stuck runs from previous server instance
+  // 🔥 STARTUP: Load settings + clean up stuck runs
   (async () => {
+    // Load persisted settings first
+    await loadMinViewsSetting();
     try {
       // Reset any runs that were in-progress when server crashed
       const stuckProcessing = await Run.updateMany(
@@ -1328,6 +1385,31 @@ mongoose.connection.once('open', () => {
         console.error('[HEALER] Error:', healErr.message);
       }
 
+      // 🔥 AUTO-PRUNE: delete read notifications older than 7 days
+      // Runs at most once every 6 hours to protect Atlas free-tier write quota
+      const SIX_HOURS = 6 * 60 * 60 * 1000;
+      if (Date.now() - lastNotificationPruneTime > SIX_HOURS) {
+        try {
+          const pruneResult = await Notification.deleteMany({
+            read: true,
+            createdAt: { $lt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
+          });
+          if (pruneResult.deletedCount > 0) {
+            console.log(`[PRUNE] Deleted ${pruneResult.deletedCount} old notifications`);
+          }
+          // Also prune UNREAD notifications older than 30 days
+          const unreadPrune = await Notification.deleteMany({
+            createdAt: { $lt: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) },
+          });
+          if (unreadPrune.deletedCount > 0) {
+            console.log(`[PRUNE] Deleted ${unreadPrune.deletedCount} very old unread notifications`);
+          }
+          lastNotificationPruneTime = Date.now();
+        } catch (pruneErr) {
+          console.error('[PRUNE] Error:', pruneErr.message);
+        }
+      }
+
       isSchedulerRunning = false;
     }
   }, 10000);
@@ -1413,6 +1495,13 @@ app.post('/api/order', async (req, res) => {
 
     console.log(`Order updated: ${schedulerOrderId} with ${runsForOrder.length} runs`);
 
+    // Verify the order document actually exists in DB before responding
+    const verification = await Order.findOne({ schedulerOrderId });
+    if (!verification) {
+      console.error(`[CREATE ORDER] Order ${schedulerOrderId} not found after save — DB write may have failed`);
+      return res.status(500).json({ error: 'Order was processed but could not be verified in the database. Please retry.' });
+    }
+
     return res.json({
       success: true,
       message: 'Order scheduled (persistent)',
@@ -1420,6 +1509,7 @@ app.post('/api/order', async (req, res) => {
       status: 'pending',
       completedRuns: 0,
       totalRuns: runsForOrder.length,
+      verified: true,
     });
   } catch (error) {
     console.error('[CREATE ORDER] Error:', error);
@@ -1696,13 +1786,15 @@ app.get('/api/settings/min-views', (req, res) => {
   return res.json({ minViewsPerRun: MIN_VIEWS_PER_RUN });
 });
 
-app.post('/api/settings/min-views', (req, res) => {
+app.post('/api/settings/min-views', async (req, res) => {
   const { minViewsPerRun } = req.body;
   if (typeof minViewsPerRun !== 'number' || minViewsPerRun < 1) {
     return res.status(400).json({ error: 'Invalid minViewsPerRun value' });
   }
   MIN_VIEWS_PER_RUN = Math.floor(minViewsPerRun);
   console.log(`Minimum views per run updated to: ${MIN_VIEWS_PER_RUN}`);
+  // Persist so value survives Render restarts
+  await saveMinViewsSetting(MIN_VIEWS_PER_RUN);
   return res.json({ success: true, minViewsPerRun: MIN_VIEWS_PER_RUN });
 });
 
