@@ -16,14 +16,30 @@ app.use(express.json());
 ========================= */ 
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://harshprajapati6882_db_user:mbyjv1uPdKtLBz1l@devanush.tqknxqf.mongodb.net/smm-panel?retryWrites=true&w=majority';
 
-mongoose.connect(MONGODB_URI, {
-  serverSelectionTimeoutMS: 30000,
-})
-.then(() => {
-  console.log('✅ MongoDB Connected Successfully');
-})
-.catch(err => {
-  console.error('❌ MongoDB Connection Error:', err);
+// ── MongoDB connect with auto-reconnect ──────────────────────────
+function connectMongo() {
+  mongoose.connect(MONGODB_URI, {
+    serverSelectionTimeoutMS: 30000,
+    socketTimeoutMS: 45000,
+    heartbeatFrequencyMS: 10000,
+    retryWrites: true,
+  })
+  .then(() => console.log('✅ MongoDB Connected Successfully'))
+  .catch(err => {
+    console.error('❌ MongoDB Connection Error:', err.message);
+    // Retry after 10 seconds on initial failure
+    setTimeout(connectMongo, 10000);
+  });
+}
+connectMongo();
+
+// Auto-reconnect on unexpected disconnect
+mongoose.connection.on('disconnected', () => {
+  console.warn('[MONGO] Disconnected — reconnecting in 5 s...');
+  setTimeout(connectMongo, 5000);
+});
+mongoose.connection.on('error', (err) => {
+  console.error('[MONGO] Connection error:', err.message);
 });
 
 /* =========================
@@ -131,6 +147,19 @@ let MIN_VIEWS_PER_RUN = 100;
 ========================= */
 let isSchedulerRunning = false;
 let schedulerTickId = 0;
+let schedulerLastTickStarted = 0; // epoch ms when last tick began
+
+// Watchdog: if scheduler mutex is stuck for > 60 s, force-release it
+setInterval(() => {
+  if (isSchedulerRunning && schedulerLastTickStarted > 0) {
+    const stuckMs = Date.now() - schedulerLastTickStarted;
+    if (stuckMs > 60000) {
+      console.warn(`[WATCHDOG] Scheduler mutex stuck for ${Math.round(stuckMs/1000)}s — force-releasing`);
+      isSchedulerRunning = false;
+      schedulerLastTickStarted = 0;
+    }
+  }
+}, 15000);
 
 /* =========================
    🔥 FIX 2: PROPER QUEUE SYSTEM
@@ -150,6 +179,32 @@ let isExecutingShares = false;
 let isExecutingSaves = false;
 let isExecutingComments = false;
 let isExecutingReposts = false;
+
+/* =========================
+   🔥 DB WRITE RETRY WRAPPER
+   Retries transient MongoDB write failures (network blips, Atlas hiccups)
+   up to 3 times with 500 ms backoff before giving up.
+========================= */
+async function withRetry(fn, label = 'DB op', retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const isTransient =
+        err.name === 'MongoNetworkError' ||
+        err.name === 'MongoServerSelectionError' ||
+        err.message?.includes('ECONNRESET') ||
+        err.message?.includes('ETIMEDOUT') ||
+        err.message?.includes('topology was destroyed');
+      if (isTransient && attempt < retries) {
+        console.warn(`[RETRY] ${label} attempt ${attempt} failed (${err.message}) — retrying in 500ms`);
+        await new Promise(r => setTimeout(r, 500 * attempt));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
 
 /* =========================
    PLACE ORDER
@@ -343,7 +398,7 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
    Returns null if ANY other process already claimed it
 ========================= */
 async function atomicClaimRun(runId, tickId) {
-  const result = await Run.findOneAndUpdate(
+  const result = await withRetry(() => Run.findOneAndUpdate(
     {
       _id: runId,
       status: 'pending',           // 🔥 MUST be pending
@@ -361,7 +416,7 @@ async function atomicClaimRun(runId, tickId) {
     {
       new: true,
     }
-  );
+  ), 'atomicClaimRun');
 
   return result; // null = someone else got it first
 }
@@ -600,7 +655,7 @@ async function executeRun(run, tickId) {
 
       if (isActiveOrderError) {
         const currentRetryCount = lockedRun.retryCount || 0;
-        const MAX_RETRIES = 6; // 6 × 5 min = 30 min max
+        const MAX_RETRIES = 36; // 36 × 5 min = 3 hours max
 
         if (currentRetryCount < MAX_RETRIES) {
           // 🔥 Reschedule +5 minutes and retry
@@ -706,7 +761,7 @@ async function executeRun(run, tickId) {
                 {
                   $set: {
                     status: 'failed',
-                    error: `Max retries (${MAX_RETRIES}) reached. Previous order #${previousRunForForce.smmOrderId} still "${statusNow}" after 30 min.`,
+                    error: `Max retries (${MAX_RETRIES}) reached. Previous order #${previousRunForForce.smmOrderId} still "${statusNow}" after max retries.`,
                     done: true,
                   }
                 }
@@ -1132,6 +1187,7 @@ mongoose.connection.once('open', () => {
     }
 
     isSchedulerRunning = true;
+    schedulerLastTickStarted = Date.now();
     schedulerTickId++;
     const tickId = `tick-${schedulerTickId}-${Date.now()}`;
 
@@ -1236,44 +1292,40 @@ mongoose.connection.once('open', () => {
             } catch (error) {
       console.error('[SCHEDULER] Error:', error);
     } finally {
-      // 🔥 NOTIFICATION: Check for stuck runs
+      // 🔥 AUTO-HEALER: find and reset stuck runs every tick
       try {
-        const stuckProcessingRuns = await Run.find({
-          status: 'processing',
-          executedAt: null,
-          lockedAt: { $lt: new Date(Date.now() - 25 * 60 * 1000) },
-        });
-
-        for (const stuckRun of stuckProcessingRuns) {
+        // processing > 10 min with no executedAt → server crashed mid-run → reset to pending
+        const healedProcessing = await Run.updateMany(
+          {
+            status: 'processing',
+            executedAt: null,
+            lockedAt: { $lt: new Date(Date.now() - 10 * 60 * 1000) },
+          },
+          { $set: { status: 'pending', executionLock: null, lockedAt: null, claimedByTick: null } }
+        );
+        if (healedProcessing.modifiedCount > 0) {
+          console.log(`[HEALER] Reset ${healedProcessing.modifiedCount} stuck processing run(s) → pending`);
           await createNotification({
             type: 'run_stuck',
             severity: 'warning',
-            title: stuckRun.label + ' run stuck in processing',
-            message: stuckRun.label + ' run (qty: ' + stuckRun.quantity + ') has been processing for over 25 minutes without completing.',
-            schedulerOrderId: stuckRun.schedulerOrderId,
-            runId: stuckRun._id.toString(),
-            label: stuckRun.label,
+            title: `Auto-healed ${healedProcessing.modifiedCount} stuck run(s)`,
+            message: `${healedProcessing.modifiedCount} run(s) were stuck in processing for over 10 minutes and have been reset to pending for retry.`,
           });
         }
 
-        const stuckQueuedRuns = await Run.find({
-          status: 'queued',
-          lockedAt: { $lt: new Date(Date.now() - 10 * 60 * 1000) },
-        });
-
-        for (const stuckRun of stuckQueuedRuns) {
-          await createNotification({
-            type: 'run_stuck_queued',
-            severity: 'warning',
-            title: stuckRun.label + ' run stuck in queue',
-            message: stuckRun.label + ' run (qty: ' + stuckRun.quantity + ') has been queued for over 10 minutes without execution.',
-            schedulerOrderId: stuckRun.schedulerOrderId,
-            runId: stuckRun._id.toString(),
-            label: stuckRun.label,
-          });
+        // queued > 5 min → claim lock abandoned → reset to pending
+        const healedQueued = await Run.updateMany(
+          {
+            status: 'queued',
+            lockedAt: { $lt: new Date(Date.now() - 5 * 60 * 1000) },
+          },
+          { $set: { status: 'pending', executionLock: null, lockedAt: null, claimedByTick: null } }
+        );
+        if (healedQueued.modifiedCount > 0) {
+          console.log(`[HEALER] Reset ${healedQueued.modifiedCount} stuck queued run(s) → pending`);
         }
-      } catch (notifErr) {
-        console.error('[SCHEDULER] Notification check error:', notifErr.message);
+      } catch (healErr) {
+        console.error('[HEALER] Error:', healErr.message);
       }
 
       isSchedulerRunning = false;
@@ -1287,6 +1339,12 @@ mongoose.connection.once('open', () => {
 ========================= */
 app.get('/', (req, res) => {
   res.json({ ok: true, service: 'smm-scheduler', time: new Date().toISOString() });
+});
+
+// Lightweight ping — no DB touch, responds in <5 ms
+// Point UptimeRobot (free) at: https://backend-new-6tzb.onrender.com/ping
+app.get('/ping', (req, res) => {
+  res.json({ pong: true, time: new Date().toISOString() });
 });
 
 /* =========================
@@ -1788,15 +1846,19 @@ app.post('/api/scheduler/trigger', async (req, res) => {
 /* =========================
    START SERVER
 ========================= */
+// ── Keep-alive: ping self every 4 minutes so Render free-tier
+//    doesn't mark us as idle. The real solution for sleep prevention
+//    is to use UptimeRobot (free) pointing at this URL from outside.
+//    Self-ping still resets the idle timer on most free-tier hosts.
 setInterval(async () => {
   try {
-    const keepAliveUrl = process.env.KEEP_ALIVE_URL || "https://backend-new-6tzb.onrender.com/";
-    await axios.get(keepAliveUrl, { timeout: 15000 });
-    console.log("[PING] Keep-alive OK");
+    const keepAliveUrl = process.env.KEEP_ALIVE_URL || 'https://backend-new-6tzb.onrender.com/ping';
+    await axios.get(keepAliveUrl, { timeout: 10000 });
+    console.log('[PING] Keep-alive OK');
   } catch (e) {
-    console.log("[PING] Keep-alive skipped/failed");
+    console.log('[PING] Keep-alive failed (non-critical):', e.message);
   }
-}, 5 * 60 * 1000);
+}, 4 * 60 * 1000); // 4 minutes — under Render's 15-min idle threshold
 
 /* =========================
    🔥 NEW: Check provider order status
@@ -2237,7 +2299,21 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`6 Queue system: VIEWS | LIKES | SHARES | SAVES | COMMENTS | REPOSTS`);
   console.log(`Scheduler runs every 10 seconds`);
   console.log(`🔒 Bulletproof atomic execution locks ENABLED`);
-  console.log(`🔒 Scheduler mutex ENABLED`);
+  console.log(`🔒 Scheduler mutex ENABLED + Watchdog ENABLED`);
   console.log(`🔒 Tick-based claim tracking ENABLED`);
+  console.log(`🔒 Auto-healer ENABLED`);
+  console.log(`🔒 DB retry wrapper ENABLED`);
   console.log(`========================================`);
+});
+
+// ── Crash protection: log unhandled errors instead of crashing ──
+// On free Render tier a crash = cold start = scheduler gap.
+process.on('uncaughtException', (err) => {
+  console.error('[UNCAUGHT EXCEPTION] Non-fatal error caught:', err.message, err.stack);
+  // Do NOT call process.exit() — let the process keep running
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[UNHANDLED REJECTION] Non-fatal rejection caught:', reason);
+  // Do NOT call process.exit()
 });
