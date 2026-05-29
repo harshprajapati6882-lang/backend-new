@@ -336,14 +336,13 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
       // 🔥 Use per-service API if provided, otherwise fall back to baseConfig
       let serviceApiUrl = serviceConfig.apiUrl || baseConfig.apiUrl;
       let serviceApiKey = serviceConfig.apiKey || baseConfig.apiKey;
-      let serviceMin = serviceConfig.serviceMin || null; // 🔥 Per-service minimum from SMM panel
+      let serviceMin = serviceConfig.serviceMin || null;
       let serviceIdForRun = serviceConfig.serviceId;
 
-      // 🔥 NEW: per-run service override (used by the "Premium Drip Likes"
-      // feature on the frontend). When a run carries a `serviceIdOverride`,
-      // we route THAT single run to a different provider/service while the
-      // rest of the runs in this engagement type stay on the bundle's
-      // normal service. Apply / API / key / serviceMin can all be overridden.
+      // 🔥 Per-run override (used by the Sub-Likes feature). When a run carries
+      // override fields, that single run uses a different service / API /
+      // credentials. Lets us drip-feed via a min=1 service while normal
+      // likes continue on the bundle's standard service.
       if (run.serviceIdOverride) {
         serviceIdForRun = run.serviceIdOverride;
         if (run.apiUrlOverride) serviceApiUrl = run.apiUrlOverride;
@@ -351,7 +350,6 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
         if (run.serviceMinOverride !== undefined && run.serviceMinOverride !== null) {
           serviceMin = run.serviceMinOverride;
         }
-        console.log(`[ADD RUN] ${label} qty=${quantity} OVERRIDE → service=${serviceIdForRun}`);
       }
 
           const runData = new Run({
