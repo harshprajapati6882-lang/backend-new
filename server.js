@@ -3,64 +3,60 @@ const cors = require('cors');
 const axios = require('axios');
 const mongoose = require('mongoose');
 const crypto = require('crypto');
-mongoose.set('bufferCommands', false);
+// 🔥 FIX #16: bufferCommands stays ON (default).
+// With bufferCommands:false, every query during a Mongo blip throws instantly
+// and our 10-second scheduler tick crashes. The default behaviour queues the
+// op for a few seconds, gives Mongo a chance to recover, and only then errors.
+// (line previously: mongoose.set('bufferCommands', false);)
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// ── Restricted CORS ──────────────────────────────────────────────
-// Only allow requests from the Vercel frontend and localhost dev.
-// Set CORS_ORIGIN env var on Render to your exact Vercel URL.
-// Multiple origins: comma-separated e.g. "https://a.vercel.app,https://b.vercel.app"
-const ALLOWED_ORIGINS = (() => {
-  const raw = process.env.CORS_ORIGIN || 'https://iambatman-topaz.vercel.app';
-  return raw.split(',').map(o => o.trim()).filter(Boolean);
-})();
-
-app.use(cors({
-  origin: (origin, callback) => {
-    // Allow requests with no origin (Render health checks, curl, UptimeRobot)
-    if (!origin) return callback(null, true);
-    // Allow any localhost port for development
-    if (/^https?:\/\/localhost(:\d+)?$/.test(origin)) return callback(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-    console.warn(`[CORS] Blocked origin: ${origin}`);
-    callback(new Error(`CORS: origin ${origin} not allowed`));
-  },
-  credentials: true,
-}));
-app.use(express.json({ limit: '2mb' }));
+app.use(cors());
+app.use(express.json());
 
 /* =========================
    🔥 MONGODB CONNECTION
-========================= */ 
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://harshprajapati6882_db_user:mbyjv1uPdKtLBz1l@devanush.tqknxqf.mongodb.net/smm-panel?retryWrites=true&w=majority';
-
-// ── MongoDB connect with auto-reconnect ──────────────────────────
-function connectMongo() {
-  mongoose.connect(MONGODB_URI, {
-    serverSelectionTimeoutMS: 30000,
-    socketTimeoutMS: 45000,
-    heartbeatFrequencyMS: 10000,
-    retryWrites: true,
-  })
-  .then(() => console.log('✅ MongoDB Connected Successfully'))
-  .catch(err => {
-    console.error('❌ MongoDB Connection Error:', err.message);
-    // Retry after 10 seconds on initial failure
-    setTimeout(connectMongo, 10000);
-  });
+========================= */
+const MONGODB_URI = process.env.MONGODB_URI;
+if (!MONGODB_URI) {
+  console.error('❌ MONGODB_URI env var is not set. Refusing to start.');
+  process.exit(1);
 }
-connectMongo();
 
-// Auto-reconnect on unexpected disconnect
+// Auto-reconnect with exponential backoff so a transient Atlas outage
+// doesn't permanently break the dyno on Render free tier.
+let mongoReconnectAttempts = 0;
+async function connectMongo() {
+  try {
+    await mongoose.connect(MONGODB_URI, {
+      serverSelectionTimeoutMS: 30000,
+      // socketTimeoutMS keeps a dead TCP socket from blocking the pool forever
+      socketTimeoutMS: 45000,
+      // Cap pool size — free Atlas tier (M0) only allows ~100 conns total
+      maxPoolSize: 10,
+    });
+    mongoReconnectAttempts = 0;
+    console.log('✅ MongoDB Connected Successfully');
+  } catch (err) {
+    mongoReconnectAttempts += 1;
+    const delay = Math.min(60_000, 2_000 * Math.pow(2, Math.min(mongoReconnectAttempts, 5)));
+    console.error(`❌ MongoDB Connection Error (attempt ${mongoReconnectAttempts}). Retrying in ${delay / 1000}s:`, err.message);
+    setTimeout(connectMongo, delay);
+  }
+}
+
 mongoose.connection.on('disconnected', () => {
-  console.warn('[MONGO] Disconnected — reconnecting in 5 s...');
-  setTimeout(connectMongo, 5000);
+  console.warn('⚠️  MongoDB disconnected. Mongoose will auto-reconnect.');
+});
+mongoose.connection.on('reconnected', () => {
+  console.log('✅ MongoDB reconnected');
 });
 mongoose.connection.on('error', (err) => {
-  console.error('[MONGO] Connection error:', err.message);
+  console.error('❌ MongoDB connection error event:', err.message);
 });
+
+connectMongo();
 
 /* =========================
    🔥 MONGODB SCHEMAS
@@ -128,13 +124,6 @@ const NotificationSchema = new mongoose.Schema({
 NotificationSchema.index({ createdAt: -1 });
 NotificationSchema.index({ read: 1, createdAt: -1 });
 
-// ── Settings schema — persists server settings across restarts ──
-const SettingsSchema = new mongoose.Schema({
-  key:   { type: String, required: true, unique: true },
-  value: { type: mongoose.Schema.Types.Mixed, required: true },
-});
-const Settings = mongoose.model('Settings', SettingsSchema);
-
 const Run = mongoose.model('Run', RunSchema);
 const Order = mongoose.model('Order', OrderSchema);
 const Notification = mongoose.model('Notification', NotificationSchema);
@@ -165,35 +154,8 @@ async function createNotification({ type, severity, title, message, schedulerOrd
 
 /* =========================
    MINIMUM VIEWS PER RUN
-   Loaded from MongoDB on startup so it survives Render restarts.
 ========================= */
 let MIN_VIEWS_PER_RUN = 100;
-
-async function loadMinViewsSetting() {
-  try {
-    const doc = await Settings.findOne({ key: 'minViewsPerRun' });
-    if (doc && typeof doc.value === 'number' && doc.value >= 1) {
-      MIN_VIEWS_PER_RUN = Math.floor(doc.value);
-      console.log(`[SETTINGS] Loaded minViewsPerRun = ${MIN_VIEWS_PER_RUN} from DB`);
-    } else {
-      console.log(`[SETTINGS] No saved minViewsPerRun — using default ${MIN_VIEWS_PER_RUN}`);
-    }
-  } catch (err) {
-    console.warn('[SETTINGS] Could not load minViewsPerRun:', err.message);
-  }
-}
-
-async function saveMinViewsSetting(value) {
-  try {
-    await Settings.findOneAndUpdate(
-      { key: 'minViewsPerRun' },
-      { value },
-      { upsert: true, new: true }
-    );
-  } catch (err) {
-    console.warn('[SETTINGS] Could not save minViewsPerRun:', err.message);
-  }
-}
 
 /* =========================
    🔥 FIX 1: SCHEDULER LOCK
@@ -201,20 +163,6 @@ async function saveMinViewsSetting(value) {
 ========================= */
 let isSchedulerRunning = false;
 let schedulerTickId = 0;
-let schedulerLastTickStarted = 0; // epoch ms when last tick began
-let lastNotificationPruneTime = 0; // epoch ms — prune runs once every 6 hours
-
-// Watchdog: if scheduler mutex is stuck for > 60 s, force-release it
-setInterval(() => {
-  if (isSchedulerRunning && schedulerLastTickStarted > 0) {
-    const stuckMs = Date.now() - schedulerLastTickStarted;
-    if (stuckMs > 60000) {
-      console.warn(`[WATCHDOG] Scheduler mutex stuck for ${Math.round(stuckMs/1000)}s — force-releasing`);
-      isSchedulerRunning = false;
-      schedulerLastTickStarted = 0;
-    }
-  }
-}, 15000);
 
 /* =========================
    🔥 FIX 2: PROPER QUEUE SYSTEM
@@ -234,32 +182,6 @@ let isExecutingShares = false;
 let isExecutingSaves = false;
 let isExecutingComments = false;
 let isExecutingReposts = false;
-
-/* =========================
-   🔥 DB WRITE RETRY WRAPPER
-   Retries transient MongoDB write failures (network blips, Atlas hiccups)
-   up to 3 times with 500 ms backoff before giving up.
-========================= */
-async function withRetry(fn, label = 'DB op', retries = 3) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      const isTransient =
-        err.name === 'MongoNetworkError' ||
-        err.name === 'MongoServerSelectionError' ||
-        err.message?.includes('ECONNRESET') ||
-        err.message?.includes('ETIMEDOUT') ||
-        err.message?.includes('topology was destroyed');
-      if (isTransient && attempt < retries) {
-        console.warn(`[RETRY] ${label} attempt ${attempt} failed (${err.message}) — retrying in 500ms`);
-        await new Promise(r => setTimeout(r, 500 * attempt));
-        continue;
-      }
-      throw err;
-    }
-  }
-}
 
 /* =========================
    PLACE ORDER
@@ -411,10 +333,26 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
 
       console.log(`[ADD RUN] ${label} qty=${quantity} | base=${new Date(baseTime).toISOString()} | delay=${Math.round(delay / 60000)}min | actual=${staggeredTime.toISOString()}`);
 
-                  // 🔥 Use per-service API if provided, otherwise fall back to baseConfig
-      const serviceApiUrl = serviceConfig.apiUrl || baseConfig.apiUrl;
-      const serviceApiKey = serviceConfig.apiKey || baseConfig.apiKey;
-      const serviceMin = serviceConfig.serviceMin || null; // 🔥 Per-service minimum from SMM panel
+      // 🔥 Use per-service API if provided, otherwise fall back to baseConfig
+      let serviceApiUrl = serviceConfig.apiUrl || baseConfig.apiUrl;
+      let serviceApiKey = serviceConfig.apiKey || baseConfig.apiKey;
+      let serviceMin = serviceConfig.serviceMin || null; // 🔥 Per-service minimum from SMM panel
+      let serviceIdForRun = serviceConfig.serviceId;
+
+      // 🔥 NEW: per-run service override (used by the "Premium Drip Likes"
+      // feature on the frontend). When a run carries a `serviceIdOverride`,
+      // we route THAT single run to a different provider/service while the
+      // rest of the runs in this engagement type stay on the bundle's
+      // normal service. Apply / API / key / serviceMin can all be overridden.
+      if (run.serviceIdOverride) {
+        serviceIdForRun = run.serviceIdOverride;
+        if (run.apiUrlOverride) serviceApiUrl = run.apiUrlOverride;
+        if (run.apiKeyOverride) serviceApiKey = run.apiKeyOverride;
+        if (run.serviceMinOverride !== undefined && run.serviceMinOverride !== null) {
+          serviceMin = run.serviceMinOverride;
+        }
+        console.log(`[ADD RUN] ${label} qty=${quantity} OVERRIDE → service=${serviceIdForRun}`);
+      }
 
           const runData = new Run({
         id: Date.now() + Math.random(),
@@ -422,7 +360,7 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
         label,
         apiUrl: serviceApiUrl,
         apiKey: serviceApiKey,
-        service: serviceConfig.serviceId,
+        service: serviceIdForRun,
         link: baseConfig.link,
         quantity: quantity,
         time: staggeredTime, // 🔥 Use staggered time instead of original
@@ -453,7 +391,7 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
    Returns null if ANY other process already claimed it
 ========================= */
 async function atomicClaimRun(runId, tickId) {
-  const result = await withRetry(() => Run.findOneAndUpdate(
+  const result = await Run.findOneAndUpdate(
     {
       _id: runId,
       status: 'pending',           // 🔥 MUST be pending
@@ -471,7 +409,7 @@ async function atomicClaimRun(runId, tickId) {
     {
       new: true,
     }
-  ), 'atomicClaimRun');
+  );
 
   return result; // null = someone else got it first
 }
@@ -710,11 +648,13 @@ async function executeRun(run, tickId) {
 
       if (isActiveOrderError) {
         const currentRetryCount = lockedRun.retryCount || 0;
-        const MAX_RETRIES = 36; // 36 × 5 min = 3 hours max
+        const MAX_RETRIES = 6; // 6 × 5 min = 30 min max
 
         if (currentRetryCount < MAX_RETRIES) {
-          // 🔥 Reschedule +5 minutes and retry
-          const retryTime = new Date(Date.now() + 5 * 60 * 1000);
+          // 🔥 FIX #14: exponential backoff — 5, 10, 20, 40, 60, 60 minutes
+          // instead of a flat 5 min. Prevents hammering a rate-limited provider.
+          const backoffMinutes = Math.min(60, 5 * Math.pow(2, currentRetryCount));
+          const retryTime = new Date(Date.now() + backoffMinutes * 60 * 1000);
           console.log(`[${lockedRun.label}] Active order conflict. Retry ${currentRetryCount + 1}/${MAX_RETRIES} at ${retryTime.toISOString()}`);
 
                     // 🔥 FIX: Check if order was cancelled before rescheduling
@@ -816,7 +756,7 @@ async function executeRun(run, tickId) {
                 {
                   $set: {
                     status: 'failed',
-                    error: `Max retries (${MAX_RETRIES}) reached. Previous order #${previousRunForForce.smmOrderId} still "${statusNow}" after max retries.`,
+                    error: `Max retries (${MAX_RETRIES}) reached. Previous order #${previousRunForForce.smmOrderId} still "${statusNow}" after 30 min.`,
                     done: true,
                   }
                 }
@@ -892,7 +832,9 @@ async function executeRun(run, tickId) {
           const MAX_RETRIES = 4; // 4 × 5 min = 20 min max for provider errors
 
           if (currentRetryCount < MAX_RETRIES) {
-            const retryTime = new Date(Date.now() + 5 * 60 * 1000);
+            // 🔥 FIX #14: exponential backoff (5, 10, 20, 40, 60, 60 min)
+            const backoffMinutes = Math.min(60, 5 * Math.pow(2, currentRetryCount));
+            const retryTime = new Date(Date.now() + backoffMinutes * 60 * 1000);
             console.log(`[${lockedRun.label}] Provider error (${errorMsg.slice(0, 50)}). Retry ${currentRetryCount + 1}/${MAX_RETRIES} at ${retryTime.toISOString()}`);
 
             // Check if order was cancelled before rescheduling
@@ -979,7 +921,9 @@ async function executeRun(run, tickId) {
       const MAX_RETRIES = 4;
 
       if (currentRetryCount < MAX_RETRIES) {
-        const retryTime = new Date(Date.now() + 5 * 60 * 1000);
+        // 🔥 FIX #14: exponential backoff (5, 10, 20, 40, 60, 60 min)
+        const backoffMinutes = Math.min(60, 5 * Math.pow(2, currentRetryCount));
+        const retryTime = new Date(Date.now() + backoffMinutes * 60 * 1000);
         console.log(`[${run.label}] Network error, retry ${currentRetryCount + 1}/${MAX_RETRIES} at ${retryTime.toISOString()}`);
 
         // Check if order was cancelled
@@ -1063,15 +1007,9 @@ async function updateOrderStatus(schedulerOrderId) {
     const cancelledRuns = orderRuns.filter(r => r.status === 'cancelled').length;
 
     let newStatus;
-    // 🔥 FIX Issue-2: Manually cancelled orders ALWAYS stay cancelled,
-    // even if a run that was mid-processing finishes and calls updateOrderStatus.
-    // We check this FIRST before any other logic.
     if (order.status === 'cancelled') {
-      newStatus = 'cancelled';
-    } else if (order.status === 'paused') {
-      // Paused orders stay paused until resumed — don't flip back to running.
-      newStatus = 'paused';
-    } else if (completedRuns + failedRuns + cancelledRuns === totalRuns) {
+      newStatus = 'cancelled'; // 🔥 Don't override manual cancellation
+        } else if (completedRuns + failedRuns + cancelledRuns === totalRuns) {
       // All runs are done (one way or another)
       if (completedRuns === totalRuns) {
         newStatus = 'completed';
@@ -1080,6 +1018,7 @@ async function updateOrderStatus(schedulerOrderId) {
       } else if (cancelledRuns === totalRuns) {
         newStatus = 'cancelled';
       } else if (cancelledRuns > 0 && completedRuns > 0) {
+        // 🔥 FIX: Mix of completed + cancelled = completed (not running)
         newStatus = 'completed';
       } else {
         newStatus = 'completed';
@@ -1205,10 +1144,8 @@ function processRepostsQueue() {
 mongoose.connection.once('open', () => {
   console.log("🚀 Scheduler started after DB connected");
 
-  // 🔥 STARTUP: Load settings + clean up stuck runs
+  // 🔥 STARTUP: Clean up stuck runs from previous server instance
   (async () => {
-    // Load persisted settings first
-    await loadMinViewsSetting();
     try {
       // Reset any runs that were in-progress when server crashed
       const stuckProcessing = await Run.updateMany(
@@ -1244,7 +1181,6 @@ mongoose.connection.once('open', () => {
     }
 
     isSchedulerRunning = true;
-    schedulerLastTickStarted = Date.now();
     schedulerTickId++;
     const tickId = `tick-${schedulerTickId}-${Date.now()}`;
 
@@ -1349,65 +1285,44 @@ mongoose.connection.once('open', () => {
             } catch (error) {
       console.error('[SCHEDULER] Error:', error);
     } finally {
-      // 🔥 AUTO-HEALER: find and reset stuck runs every tick
+      // 🔥 NOTIFICATION: Check for stuck runs
       try {
-        // processing > 10 min with no executedAt → server crashed mid-run → reset to pending
-        const healedProcessing = await Run.updateMany(
-          {
-            status: 'processing',
-            executedAt: null,
-            lockedAt: { $lt: new Date(Date.now() - 10 * 60 * 1000) },
-          },
-          { $set: { status: 'pending', executionLock: null, lockedAt: null, claimedByTick: null } }
-        );
-        if (healedProcessing.modifiedCount > 0) {
-          console.log(`[HEALER] Reset ${healedProcessing.modifiedCount} stuck processing run(s) → pending`);
+        const stuckProcessingRuns = await Run.find({
+          status: 'processing',
+          executedAt: null,
+          lockedAt: { $lt: new Date(Date.now() - 25 * 60 * 1000) },
+        });
+
+        for (const stuckRun of stuckProcessingRuns) {
           await createNotification({
             type: 'run_stuck',
             severity: 'warning',
-            title: `Auto-healed ${healedProcessing.modifiedCount} stuck run(s)`,
-            message: `${healedProcessing.modifiedCount} run(s) were stuck in processing for over 10 minutes and have been reset to pending for retry.`,
+            title: stuckRun.label + ' run stuck in processing',
+            message: stuckRun.label + ' run (qty: ' + stuckRun.quantity + ') has been processing for over 25 minutes without completing.',
+            schedulerOrderId: stuckRun.schedulerOrderId,
+            runId: stuckRun._id.toString(),
+            label: stuckRun.label,
           });
         }
 
-        // queued > 5 min → claim lock abandoned → reset to pending
-        const healedQueued = await Run.updateMany(
-          {
-            status: 'queued',
-            lockedAt: { $lt: new Date(Date.now() - 5 * 60 * 1000) },
-          },
-          { $set: { status: 'pending', executionLock: null, lockedAt: null, claimedByTick: null } }
-        );
-        if (healedQueued.modifiedCount > 0) {
-          console.log(`[HEALER] Reset ${healedQueued.modifiedCount} stuck queued run(s) → pending`);
-        }
-      } catch (healErr) {
-        console.error('[HEALER] Error:', healErr.message);
-      }
+        const stuckQueuedRuns = await Run.find({
+          status: 'queued',
+          lockedAt: { $lt: new Date(Date.now() - 10 * 60 * 1000) },
+        });
 
-      // 🔥 AUTO-PRUNE: delete read notifications older than 7 days
-      // Runs at most once every 6 hours to protect Atlas free-tier write quota
-      const SIX_HOURS = 6 * 60 * 60 * 1000;
-      if (Date.now() - lastNotificationPruneTime > SIX_HOURS) {
-        try {
-          const pruneResult = await Notification.deleteMany({
-            read: true,
-            createdAt: { $lt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
+        for (const stuckRun of stuckQueuedRuns) {
+          await createNotification({
+            type: 'run_stuck_queued',
+            severity: 'warning',
+            title: stuckRun.label + ' run stuck in queue',
+            message: stuckRun.label + ' run (qty: ' + stuckRun.quantity + ') has been queued for over 10 minutes without execution.',
+            schedulerOrderId: stuckRun.schedulerOrderId,
+            runId: stuckRun._id.toString(),
+            label: stuckRun.label,
           });
-          if (pruneResult.deletedCount > 0) {
-            console.log(`[PRUNE] Deleted ${pruneResult.deletedCount} old notifications`);
-          }
-          // Also prune UNREAD notifications older than 30 days
-          const unreadPrune = await Notification.deleteMany({
-            createdAt: { $lt: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) },
-          });
-          if (unreadPrune.deletedCount > 0) {
-            console.log(`[PRUNE] Deleted ${unreadPrune.deletedCount} very old unread notifications`);
-          }
-          lastNotificationPruneTime = Date.now();
-        } catch (pruneErr) {
-          console.error('[PRUNE] Error:', pruneErr.message);
         }
+      } catch (notifErr) {
+        console.error('[SCHEDULER] Notification check error:', notifErr.message);
       }
 
       isSchedulerRunning = false;
@@ -1423,12 +1338,6 @@ app.get('/', (req, res) => {
   res.json({ ok: true, service: 'smm-scheduler', time: new Date().toISOString() });
 });
 
-// Lightweight ping — no DB touch, responds in <5 ms
-// Point UptimeRobot (free) at: https://backend-new-6tzb.onrender.com/ping
-app.get('/ping', (req, res) => {
-  res.json({ pong: true, time: new Date().toISOString() });
-});
-
 /* =========================
    API ENDPOINTS
 ========================= */
@@ -1439,21 +1348,6 @@ app.post('/api/order', async (req, res) => {
 
     if (!apiUrl || !apiKey || !link || !services) {
       return res.status(400).json({ error: 'Missing required fields' });
-    }
-
-    // 🔥 FIX Issue-1: Block new orders on the same link if an active order exists.
-    // "Active" means pending / running / processing / paused.
-    // Cancelled, completed, and failed orders do NOT block new ones.
-    const existingActive = await Order.findOne({
-      link,
-      status: { $in: ['pending', 'running', 'processing', 'paused'] },
-    });
-    if (existingActive) {
-      return res.status(409).json({
-        error: `An active order already exists for this link (ID: ${existingActive.schedulerOrderId}, status: ${existingActive.status}). Cancel or wait for it to complete before placing a new order on the same link.`,
-        activeOrderId: existingActive.schedulerOrderId,
-        activeOrderStatus: existingActive.status,
-      });
     }
 
     console.log('Creating new order...');
@@ -1495,13 +1389,6 @@ app.post('/api/order', async (req, res) => {
 
     console.log(`Order updated: ${schedulerOrderId} with ${runsForOrder.length} runs`);
 
-    // Verify the order document actually exists in DB before responding
-    const verification = await Order.findOne({ schedulerOrderId });
-    if (!verification) {
-      console.error(`[CREATE ORDER] Order ${schedulerOrderId} not found after save — DB write may have failed`);
-      return res.status(500).json({ error: 'Order was processed but could not be verified in the database. Please retry.' });
-    }
-
     return res.json({
       success: true,
       message: 'Order scheduled (persistent)',
@@ -1509,7 +1396,6 @@ app.post('/api/order', async (req, res) => {
       status: 'pending',
       completedRuns: 0,
       totalRuns: runsForOrder.length,
-      verified: true,
     });
   } catch (error) {
     console.error('[CREATE ORDER] Error:', error);
@@ -1524,8 +1410,11 @@ app.post('/api/services', async (req, res) => {
   }
   try {
     const params = new URLSearchParams({ key: apiKey, action: 'services' });
+    // 🔥 FIX #15: hard 20-second timeout so a hung provider doesn't pin a
+    // request thread on the free-tier dyno forever.
     const response = await axios.post(apiUrl, params.toString(), {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: 20000,
     });
     return res.json(response.data);
   } catch (error) {
@@ -1614,13 +1503,11 @@ app.post('/api/order/control', async (req, res) => {
     }
 
     if (action === 'cancel') {
-      // 🔥 FIX Issue-2: Cancel ALL non-completed, non-failed runs including 'retrying'.
-      // 'retrying' runs would otherwise re-queue on the next scheduler tick and
-      // bring the order back to 'running'.
-      await Run.updateMany(
+      // 🔥 Bulk cancel all non-completed runs
+            await Run.updateMany(
         {
           schedulerOrderId,
-          status: { $in: ['pending', 'processing', 'queued', 'paused', 'retrying'] }
+          status: { $in: ['pending', 'processing', 'queued', 'paused'] }
         },
         { $set: { status: 'cancelled', done: true, executionLock: null, claimedByTick: null } }
       );
@@ -1786,15 +1673,13 @@ app.get('/api/settings/min-views', (req, res) => {
   return res.json({ minViewsPerRun: MIN_VIEWS_PER_RUN });
 });
 
-app.post('/api/settings/min-views', async (req, res) => {
+app.post('/api/settings/min-views', (req, res) => {
   const { minViewsPerRun } = req.body;
   if (typeof minViewsPerRun !== 'number' || minViewsPerRun < 1) {
     return res.status(400).json({ error: 'Invalid minViewsPerRun value' });
   }
   MIN_VIEWS_PER_RUN = Math.floor(minViewsPerRun);
   console.log(`Minimum views per run updated to: ${MIN_VIEWS_PER_RUN}`);
-  // Persist so value survives Render restarts
-  await saveMinViewsSetting(MIN_VIEWS_PER_RUN);
   return res.json({ success: true, minViewsPerRun: MIN_VIEWS_PER_RUN });
 });
 
@@ -1938,19 +1823,15 @@ app.post('/api/scheduler/trigger', async (req, res) => {
 /* =========================
    START SERVER
 ========================= */
-// ── Keep-alive: ping self every 4 minutes so Render free-tier
-//    doesn't mark us as idle. The real solution for sleep prevention
-//    is to use UptimeRobot (free) pointing at this URL from outside.
-//    Self-ping still resets the idle timer on most free-tier hosts.
 setInterval(async () => {
   try {
-    const keepAliveUrl = process.env.KEEP_ALIVE_URL || 'https://backend-new-6tzb.onrender.com/ping';
-    await axios.get(keepAliveUrl, { timeout: 10000 });
-    console.log('[PING] Keep-alive OK');
+    const keepAliveUrl = process.env.KEEP_ALIVE_URL || "https://backend-new-6tzb.onrender.com/";
+    await axios.get(keepAliveUrl, { timeout: 15000 });
+    console.log("[PING] Keep-alive OK");
   } catch (e) {
-    console.log('[PING] Keep-alive failed (non-critical):', e.message);
+    console.log("[PING] Keep-alive skipped/failed");
   }
-}, 4 * 60 * 1000); // 4 minutes — under Render's 15-min idle threshold
+}, 5 * 60 * 1000);
 
 /* =========================
    🔥 NEW: Check provider order status
@@ -2305,83 +2186,24 @@ app.get('/api/memory-usage', (req, res) => {
 });
 
 /* =========================
-   🔥 BULK CANCEL ENDPOINT
-   Cancel multiple orders in a single request.
-   Works for orders in ANY status — the frontend sends whatever
-   schedulerOrderIds the user has selected.
+   🔥 FIX #17: GLOBAL ERROR HANDLERS
+   - Express middleware catches sync/async route errors
+   - process-level handlers stop one rejected promise from crashing the dyno
 ========================= */
-app.post('/api/orders/bulk-cancel', async (req, res) => {
-  try {
-    const { schedulerOrderIds } = req.body;
-    if (!Array.isArray(schedulerOrderIds) || schedulerOrderIds.length === 0) {
-      return res.status(400).json({ error: 'schedulerOrderIds must be a non-empty array' });
-    }
+// Must be the LAST app.use() so it runs after all routes.
+app.use((err, req, res, _next) => {
+  console.error(`[Unhandled route error] ${req.method} ${req.path}:`, err && err.stack ? err.stack : err);
+  if (res.headersSent) return;
+  res.status(500).json({ error: 'internal_error', message: err && err.message ? err.message : 'unknown' });
+});
 
-    const results = [];
-
-    for (const schedulerOrderId of schedulerOrderIds) {
-      try {
-        const order = await Order.findOne({ schedulerOrderId });
-        if (!order) {
-          results.push({ schedulerOrderId, success: false, error: 'Order not found' });
-          continue;
-        }
-
-        // Cancel ALL non-done runs (including retrying)
-        await Run.updateMany(
-          {
-            schedulerOrderId,
-            status: { $in: ['pending', 'processing', 'queued', 'paused', 'retrying'] }
-          },
-          { $set: { status: 'cancelled', done: true, executionLock: null, claimedByTick: null } }
-        );
-
-        // Flush in-memory queues for this order
-        const flushQueue = q => q.filter(item => (item.run || item).schedulerOrderId !== schedulerOrderId);
-        viewsQueue    = flushQueue(viewsQueue);
-        likesQueue    = flushQueue(likesQueue);
-        sharesQueue   = flushQueue(sharesQueue);
-        savesQueue    = flushQueue(savesQueue);
-        commentsQueue = flushQueue(commentsQueue);
-        repostsQueue  = flushQueue(repostsQueue);
-
-        await Order.updateOne(
-          { schedulerOrderId },
-          { $set: { status: 'cancelled', lastUpdatedAt: new Date() } }
-        );
-
-        await createNotification({
-          type: 'order_cancelled',
-          severity: 'info',
-          title: 'Order bulk-cancelled',
-          message: `Order ${schedulerOrderId} was cancelled via bulk action`,
-          schedulerOrderId,
-        });
-
-        const updatedRuns = await Run.find({ schedulerOrderId });
-        results.push({
-          schedulerOrderId,
-          success: true,
-          status: 'cancelled',
-          completedRuns: updatedRuns.filter(r => r.status === 'completed').length,
-          runStatuses: updatedRuns.map(r => r.status),
-        });
-      } catch (err) {
-        results.push({ schedulerOrderId, success: false, error: err.message });
-      }
-    }
-
-    const successCount = results.filter(r => r.success).length;
-    return res.json({
-      success: true,
-      total: schedulerOrderIds.length,
-      cancelled: successCount,
-      failed: schedulerOrderIds.length - successCount,
-      results,
-    });
-  } catch (error) {
-    return res.status(500).json({ error: error.message });
-  }
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason && reason.stack ? reason.stack : reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err && err.stack ? err.stack : err);
+  // Intentionally do NOT exit — on Render free tier a restart costs ~30 s of
+  // missed runs. Let the supervisor decide based on health checks.
 });
 
 app.listen(PORT, '0.0.0.0', () => {
@@ -2391,21 +2213,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`6 Queue system: VIEWS | LIKES | SHARES | SAVES | COMMENTS | REPOSTS`);
   console.log(`Scheduler runs every 10 seconds`);
   console.log(`🔒 Bulletproof atomic execution locks ENABLED`);
-  console.log(`🔒 Scheduler mutex ENABLED + Watchdog ENABLED`);
+  console.log(`🔒 Scheduler mutex ENABLED`);
   console.log(`🔒 Tick-based claim tracking ENABLED`);
-  console.log(`🔒 Auto-healer ENABLED`);
-  console.log(`🔒 DB retry wrapper ENABLED`);
   console.log(`========================================`);
-});
-
-// ── Crash protection: log unhandled errors instead of crashing ──
-// On free Render tier a crash = cold start = scheduler gap.
-process.on('uncaughtException', (err) => {
-  console.error('[UNCAUGHT EXCEPTION] Non-fatal error caught:', err.message, err.stack);
-  // Do NOT call process.exit() — let the process keep running
-});
-
-process.on('unhandledRejection', (reason) => {
-  console.error('[UNHANDLED REJECTION] Non-fatal rejection caught:', reason);
-  // Do NOT call process.exit()
 });
