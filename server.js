@@ -124,9 +124,22 @@ const NotificationSchema = new mongoose.Schema({
 NotificationSchema.index({ createdAt: -1 });
 NotificationSchema.index({ read: 1, createdAt: -1 });
 
+const AuditLogSchema = new mongoose.Schema({
+  schedulerOrderId: { type: String, default: null, index: true },
+  runId: { type: String, default: null, index: true },
+  label: { type: String, default: null, index: true },
+  event: { type: String, required: true, index: true },
+  message: { type: String, required: true },
+  metadata: { type: mongoose.Schema.Types.Mixed, default: {} },
+  createdAt: { type: Date, default: Date.now, index: true },
+});
+AuditLogSchema.index({ schedulerOrderId: 1, createdAt: -1 });
+AuditLogSchema.index({ runId: 1, createdAt: -1 });
+
 const Run = mongoose.model('Run', RunSchema);
 const Order = mongoose.model('Order', OrderSchema);
 const Notification = mongoose.model('Notification', NotificationSchema);
+const AuditLog = mongoose.model('AuditLog', AuditLogSchema);
 
 /* =========================
    🔥 NOTIFICATION HELPER
@@ -149,6 +162,22 @@ async function createNotification({ type, severity, title, message, schedulerOrd
     console.log(`[NOTIFICATION] ${severity.toUpperCase()}: ${title}`);
   } catch (err) {
     console.error('[NOTIFICATION] Failed to save:', err.message);
+  }
+}
+
+async function createAuditLog({ schedulerOrderId, runId, label, event, message, metadata }) {
+  try {
+    await AuditLog.create({
+      schedulerOrderId: schedulerOrderId || null,
+      runId: runId ? String(runId) : null,
+      label: label || null,
+      event,
+      message,
+      metadata: metadata || {},
+      createdAt: new Date(),
+    });
+  } catch (err) {
+    console.error('[AUDIT] Failed to save:', err.message);
   }
 }
 
@@ -460,6 +489,15 @@ async function executeRun(run, tickId) {
       return;
     }
 
+    await createAuditLog({
+      schedulerOrderId: lockedRun.schedulerOrderId,
+      runId: lockedRun._id.toString(),
+      label: lockedRun.label,
+      event: 'run_processing',
+      message: `${lockedRun.label} run entered processing`,
+      metadata: { quantity: lockedRun.quantity, scheduledTime: lockedRun.time, tickId },
+    });
+
     // 🔥 STEP 2: Check if order is cancelled
     const order = await Order.findOne({ schedulerOrderId: lockedRun.schedulerOrderId });
     if (!order || order.status === 'cancelled') {
@@ -468,6 +506,7 @@ async function executeRun(run, tickId) {
         { _id: run._id, status: 'processing' },
         { $set: { status: 'cancelled', done: true } }
       );
+      await createAuditLog({ schedulerOrderId: lockedRun.schedulerOrderId, runId: run._id.toString(), label: lockedRun.label, event: 'run_cancelled', message: `${lockedRun.label} run skipped because order is cancelled`, metadata: {} });
       await updateOrderStatus(lockedRun.schedulerOrderId);
       return;
     }
@@ -636,6 +675,14 @@ async function executeRun(run, tickId) {
       if (!completed) {
         console.warn(`[${lockedRun.label}] WARNING: Run completed but status update failed`);
       }
+      await createAuditLog({
+        schedulerOrderId: lockedRun.schedulerOrderId,
+        runId: run._id.toString(),
+        label: lockedRun.label,
+        event: 'run_completed',
+        message: `${lockedRun.label} run completed. Provider order #${result.order}`,
+        metadata: { quantity: lockedRun.quantity, smmOrderId: result.order },
+      });
     } else {
       console.error(`[${lockedRun.label}] FAILED`, result);
       const errorMsg = result?.error || 'Unknown error';
@@ -880,6 +927,7 @@ async function executeRun(run, tickId) {
           { _id: run._id, status: 'processing' },
           { $set: { status: 'failed', error: errorMsg, done: true } }
         );
+        await createAuditLog({ schedulerOrderId: lockedRun.schedulerOrderId, runId: run._id.toString(), label: lockedRun.label, event: 'run_failed', message: `${lockedRun.label} run failed: ${errorMsg}`, metadata: { quantity: lockedRun.quantity } });
         await createNotification({
           type: 'run_failed',
           severity: 'critical',
@@ -970,6 +1018,7 @@ async function executeRun(run, tickId) {
         { _id: run._id, status: 'processing' },
         { $set: { status: 'failed', error: String(errorMsg), done: true } }
       );
+      await createAuditLog({ schedulerOrderId: run.schedulerOrderId, runId: run._id.toString(), label: run.label, event: 'run_error', message: `${run.label} run error: ${errorMsg}`, metadata: { quantity: run.quantity } });
     }
     await createNotification({
       type: 'run_error',
@@ -1264,6 +1313,14 @@ mongoose.connection.once('open', () => {
         }
 
         claimedCount++;
+        await createAuditLog({
+          schedulerOrderId: claimedRun.schedulerOrderId,
+          runId: claimedRun._id.toString(),
+          label: claimedRun.label,
+          event: 'run_queued',
+          message: `${claimedRun.label} run queued by scheduler`,
+          metadata: { quantity: claimedRun.quantity, tickId, scheduledTime: claimedRun.time },
+        });
         console.log(`[SCHEDULER] Claimed ${claimedRun.label} run (qty: ${claimedRun.quantity}) [${tickId}]`);
       }
 
@@ -2122,6 +2179,41 @@ app.get('/api/check-duplicates', async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 });
+/* =========================
+   🔥 API BALANCE / SERVICE HEALTH
+========================= */
+app.post('/api/balance', async (req, res) => {
+  try {
+    const { apiUrl, apiKey } = req.body;
+    if (!apiUrl || !apiKey) return res.status(400).json({ error: 'Missing API URL or key' });
+    const params = new URLSearchParams({ key: apiKey, action: 'balance' });
+    const response = await axios.post(apiUrl, params.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: 15000,
+    });
+    return res.json({ success: true, balance: response.data });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.response?.data || error.message });
+  }
+});
+
+/* =========================
+   🔥 SCHEDULER AUDIT LOGS
+========================= */
+app.get('/api/audit-logs', async (req, res) => {
+  try {
+    const limit = Math.min(500, Math.max(1, parseInt(req.query.limit, 10) || 100));
+    const filter = {};
+    if (req.query.schedulerOrderId) filter.schedulerOrderId = String(req.query.schedulerOrderId);
+    if (req.query.runId) filter.runId = String(req.query.runId);
+    if (req.query.event) filter.event = String(req.query.event);
+    const logs = await AuditLog.find(filter).sort({ createdAt: -1 }).limit(limit);
+    return res.json({ total: logs.length, logs });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
 /* =========================
    🔥 MONGODB STORAGE CHECK
 ========================= */
