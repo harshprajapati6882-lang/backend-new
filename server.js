@@ -89,6 +89,9 @@ const RunSchema = new mongoose.Schema({
   actualExecutedAt: { type: Date, default: null },
   // 🔥 NEW: Per-service minimum quantity from the SMM panel
   serviceMin: { type: Number, default: null },
+  // Delay from the corresponding VIEWS run. Used so engagement follows a
+  // rescheduled views run instead of firing at the old/original time.
+  engagementDelayMs: { type: Number, default: 0 },
 });
 
 // 🔥 COMPOUND INDEXES for atomic operations
@@ -299,26 +302,26 @@ async function checkSingleProviderStatus(apiUrl, apiKey, smmOrderId) {
    This makes engagement look organic — views first, then reactions follow naturally
 ========================= */
 function getServiceDelay(label) {
-  // 🔥 Wider, more organic delay ranges
-  // Some users react in seconds, some in hours — this mimics that spread
+  // Engagement must follow the matching VIEWS run closely and predictably.
+  // These delays are also re-applied when a VIEWS run gets rescheduled.
   switch (label) {
     case 'VIEWS':
       return 0;
     case 'LIKES':
-      // 2-90 minutes: some likes come fast, some come much later
-      return (2 + Math.random() * 88) * 60 * 1000;
+      // Likes: 2-4 minutes after views
+      return (2 + Math.random() * 2) * 60 * 1000;
     case 'SHARES':
-      // 5-120 minutes: shares are rarer and more spread out
-      return (5 + Math.random() * 115) * 60 * 1000;
+      // Shares: 4-6 minutes after views
+      return (4 + Math.random() * 2) * 60 * 1000;
     case 'SAVES':
-      // 3-150 minutes: saves happen at unpredictable times
-      return (3 + Math.random() * 147) * 60 * 1000;
+      // Saves: 4-6 minutes after views
+      return (4 + Math.random() * 2) * 60 * 1000;
     case 'COMMENTS':
-      // 8-180 minutes: comments take longest — people think before commenting
-      return (8 + Math.random() * 172) * 60 * 1000;
+      // Comments: 6-8 minutes after views
+      return (6 + Math.random() * 2) * 60 * 1000;
     case 'REPOSTS':
-      // 5-90 minutes
-      return (5 + Math.random() * 85) * 60 * 1000;
+      // Reposts: keep close to shares/saves
+      return (4 + Math.random() * 2) * 60 * 1000;
     default:
       return 0;
   }
@@ -355,7 +358,10 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
         quantity = run.quantity;
       }
 
-      // 🔥 STAGGERED: Calculate delayed time based on service type
+      // 🔥 STAGGERED: Calculate delayed time based on service type.
+      // Engagement is stored relative to its VIEWS slot. If the VIEWS run is
+      // later rescheduled, executeRun() moves this engagement run to
+      // views actual/rescheduled time + this same delay.
       const baseTime = new Date(run.time).getTime();
       const delay = getServiceDelay(label);
       const staggeredTime = new Date(baseTime + delay);
@@ -402,6 +408,8 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
         lockedAt: null,
         claimedByTick: null,
         serviceMin: serviceMin, // 🔥 Store per-service minimum from SMM panel
+        originalScheduledTime: new Date(baseTime),
+        engagementDelayMs: delay,
       });
 
       await runData.save();
@@ -539,30 +547,29 @@ async function executeRun(run, tickId) {
     // If VIEWS is still pending/retrying, postpone this run too
     // =========================================================
     if (lockedRun.label !== 'VIEWS') {
-      // Find the VIEWS run for this same order that was scheduled
-      // closest to (but before) this engagement run's original time
-      const thisRunTime = lockedRun.originalScheduledTime || lockedRun.time;
+      // Every engagement run follows the VIEWS run from the same slot.
+      // If views are rescheduled, engagement moves to the rescheduled/completed
+      // views time + its stored delay.
+      const viewSlotTime = lockedRun.originalScheduledTime || new Date(lockedRun.time.getTime() - (lockedRun.engagementDelayMs || 0));
+      const delayMs = Number.isFinite(lockedRun.engagementDelayMs) && lockedRun.engagementDelayMs > 0
+        ? lockedRun.engagementDelayMs
+        : getServiceDelay(lockedRun.label);
 
-            const correspondingViewsRun = await Run.findOne({
+      const correspondingViewsRun = await Run.findOne({
         schedulerOrderId: lockedRun.schedulerOrderId,
         label: 'VIEWS',
-        // 🔥 FIX: Find VIEWS run whose originalScheduledTime OR time
-        // is within 20 minutes BEFORE this engagement run's original time
-        // This correctly links engagement runs to their corresponding VIEWS run
         $or: [
-          // Match by originalScheduledTime (most accurate when runs have been rescheduled)
           {
             originalScheduledTime: {
-              $gte: new Date(thisRunTime.getTime() - 20 * 60 * 1000),
-              $lte: new Date(thisRunTime.getTime() + 1 * 60 * 1000),
+              $gte: new Date(viewSlotTime.getTime() - 2 * 60 * 1000),
+              $lte: new Date(viewSlotTime.getTime() + 2 * 60 * 1000),
             }
           },
-          // Fallback: match by current time field
           {
             originalScheduledTime: null,
             time: {
-              $gte: new Date(thisRunTime.getTime() - 20 * 60 * 1000),
-              $lte: new Date(thisRunTime.getTime() + 1 * 60 * 1000),
+              $gte: new Date(viewSlotTime.getTime() - 2 * 60 * 1000),
+              $lte: new Date(viewSlotTime.getTime() + 2 * 60 * 1000),
             }
           }
         ]
@@ -570,14 +577,13 @@ async function executeRun(run, tickId) {
 
       if (correspondingViewsRun) {
         const viewsStatus = correspondingViewsRun.status;
-
-        // If VIEWS run is still pending/queued/processing (retrying or waiting)
-        const viewsNotDoneYet = viewsStatus === 'pending' || viewsStatus === 'queued' || viewsStatus === 'processing';
+        const viewsNotDoneYet = viewsStatus === 'pending' || viewsStatus === 'queued' || viewsStatus === 'processing' || viewsStatus === 'paused';
 
         if (viewsNotDoneYet) {
-          console.log(`[${lockedRun.label}] VIEWS run for this slot is still "${viewsStatus}". Postponing ${lockedRun.label} by 5 min...`);
+          const targetTime = new Date(correspondingViewsRun.time.getTime() + delayMs);
+          const postponeTime = new Date(Math.max(Date.now() + 30 * 1000, targetTime.getTime()));
+          console.log(`[${lockedRun.label}] Matching VIEWS is "${viewsStatus}". Moving ${lockedRun.label} to VIEWS time + ${Math.round(delayMs / 60000)}min: ${postponeTime.toISOString()}`);
 
-          const postponeTime = new Date(Date.now() + 5 * 60 * 1000);
           await Run.findOneAndUpdate(
             { _id: run._id, status: 'processing' },
             {
@@ -587,31 +593,47 @@ async function executeRun(run, tickId) {
                 executionLock: null,
                 claimedByTick: null,
                 lockedAt: null,
-                originalScheduledTime: lockedRun.originalScheduledTime || lockedRun.time,
-                error: `Waiting for VIEWS run to complete first. VIEWS status: ${viewsStatus}. Retrying at ${postponeTime.toISOString()}`,
+                originalScheduledTime: lockedRun.originalScheduledTime || viewSlotTime,
+                engagementDelayMs: delayMs,
+                error: `Waiting for VIEWS run first. VIEWS status: ${viewsStatus}. ${lockedRun.label} will run at VIEWS time + ${Math.round(delayMs / 60000)} min.`,
               }
             }
           );
-
-          return; // Exit — will retry in 5 min
+          return;
         }
 
-        // VIEWS completed — check if it completed successfully
+        if (viewsStatus === 'completed') {
+          const viewsBaseTime = correspondingViewsRun.actualExecutedAt || correspondingViewsRun.executedAt || correspondingViewsRun.time;
+          const targetTime = new Date(viewsBaseTime.getTime() + delayMs);
+          if (Date.now() < targetTime.getTime()) {
+            console.log(`[${lockedRun.label}] VIEWS completed. Scheduling ${lockedRun.label} for ${targetTime.toISOString()} (VIEWS + ${Math.round(delayMs / 60000)}min)`);
+            await Run.findOneAndUpdate(
+              { _id: run._id, status: 'processing' },
+              {
+                $set: {
+                  status: 'pending',
+                  time: targetTime,
+                  executionLock: null,
+                  claimedByTick: null,
+                  lockedAt: null,
+                  originalScheduledTime: lockedRun.originalScheduledTime || viewSlotTime,
+                  engagementDelayMs: delayMs,
+                  error: `VIEWS completed. Waiting until ${targetTime.toISOString()} for ${lockedRun.label}.`,
+                }
+              }
+            );
+            return;
+          }
+          console.log(`[${lockedRun.label}] VIEWS completed and delay passed. Proceeding with ${lockedRun.label}.`);
+        }
+
         if (viewsStatus === 'failed') {
           console.log(`[${lockedRun.label}] VIEWS run for this slot FAILED. Proceeding with ${lockedRun.label} anyway.`);
-          // Still proceed — better to place likes even if views failed
         }
 
-                if (viewsStatus === 'cancelled') {
-          // 🔥 Don't auto-cancel engagement. If user explicitly cancelled the order,
-          // the order-level check already handles it. If VIEWS was provider-cancelled,
-          // engagement should still be placed — it's a separate service.
+        if (viewsStatus === 'cancelled') {
           console.log(`[${lockedRun.label}] VIEWS run for this slot was cancelled. Proceeding with ${lockedRun.label} anyway (separate service).`);
-          // Fall through to normal execution — do NOT cancel engagement
         }
-
-        // VIEWS is completed — safe to proceed
-        console.log(`[${lockedRun.label}] VIEWS run completed. Proceeding with ${lockedRun.label}.`);
       }
     }
     // =========================================================
@@ -723,7 +745,7 @@ async function executeRun(run, tickId) {
                 claimedByTick: null,
                 lockedAt: null,
                 retryCount: currentRetryCount + 1,
-                originalScheduledTime: currentRetryCount === 0 ? lockedRun.time : lockedRun.originalScheduledTime,
+                originalScheduledTime: lockedRun.originalScheduledTime || lockedRun.time,
                 error: `Retry ${currentRetryCount + 1}/${MAX_RETRIES}: Provider has active order for this link. Retrying at ${retryTime.toISOString()}`,
               }
             }
