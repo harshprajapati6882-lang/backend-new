@@ -302,26 +302,26 @@ async function checkSingleProviderStatus(apiUrl, apiKey, smmOrderId) {
    This makes engagement look organic — views first, then reactions follow naturally
 ========================= */
 function getServiceDelay(label) {
-  // Engagement must follow the matching VIEWS run closely and predictably.
-  // These delays are also re-applied when a VIEWS run gets rescheduled.
+  // Engagement follows the matching VIEWS run with short organic windows.
+  // These delays are stored per run and re-applied if the VIEWS run is rescheduled.
   switch (label) {
     case 'VIEWS':
       return 0;
     case 'LIKES':
-      // Likes: 2-4 minutes after views
-      return (2 + Math.random() * 2) * 60 * 1000;
+      // Likes: 1-4 minutes after views
+      return (1 + Math.random() * 3) * 60 * 1000;
     case 'SHARES':
-      // Shares: 4-6 minutes after views
-      return (4 + Math.random() * 2) * 60 * 1000;
+      // Shares: 3-8 minutes after views
+      return (3 + Math.random() * 5) * 60 * 1000;
     case 'SAVES':
-      // Saves: 4-6 minutes after views
-      return (4 + Math.random() * 2) * 60 * 1000;
+      // Saves: 3-10 minutes after views
+      return (3 + Math.random() * 7) * 60 * 1000;
     case 'COMMENTS':
-      // Comments: 6-8 minutes after views
-      return (6 + Math.random() * 2) * 60 * 1000;
+      // Comments: 5-15 minutes after views
+      return (5 + Math.random() * 10) * 60 * 1000;
     case 'REPOSTS':
-      // Reposts: keep close to shares/saves
-      return (4 + Math.random() * 2) * 60 * 1000;
+      // Reposts: similar to shares
+      return (3 + Math.random() * 5) * 60 * 1000;
     default:
       return 0;
   }
@@ -627,12 +627,31 @@ async function executeRun(run, tickId) {
           console.log(`[${lockedRun.label}] VIEWS completed and delay passed. Proceeding with ${lockedRun.label}.`);
         }
 
-        if (viewsStatus === 'failed') {
-          console.log(`[${lockedRun.label}] VIEWS run for this slot FAILED. Proceeding with ${lockedRun.label} anyway.`);
-        }
-
-        if (viewsStatus === 'cancelled') {
-          console.log(`[${lockedRun.label}] VIEWS run for this slot was cancelled. Proceeding with ${lockedRun.label} anyway (separate service).`);
+        if (viewsStatus === 'failed' || viewsStatus === 'cancelled') {
+          console.log(`[${lockedRun.label}] Matching VIEWS run is ${viewsStatus}. Cancelling ${lockedRun.label}; engagement only delivers after views are delivered.`);
+          await Run.findOneAndUpdate(
+            { _id: run._id, status: 'processing' },
+            {
+              $set: {
+                status: 'cancelled',
+                done: true,
+                executionLock: null,
+                claimedByTick: null,
+                lockedAt: null,
+                error: `Matching VIEWS run was ${viewsStatus}; ${lockedRun.label} cancelled because engagement should only deliver after views.`,
+              }
+            }
+          );
+          await createAuditLog({
+            schedulerOrderId: lockedRun.schedulerOrderId,
+            runId: run._id.toString(),
+            label: lockedRun.label,
+            event: 'run_cancelled',
+            message: `${lockedRun.label} cancelled because matching VIEWS run was ${viewsStatus}`,
+            metadata: { viewsRunId: correspondingViewsRun._id.toString(), viewsStatus },
+          });
+          await updateOrderStatus(lockedRun.schedulerOrderId);
+          return;
         }
       }
     }
